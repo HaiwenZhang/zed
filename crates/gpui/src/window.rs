@@ -9,13 +9,14 @@ use crate::{
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId,
+    GpuPaintPrimitive, GpuPaintSurface, GpuPainter, GpuPainterHandle, GpuSpecs, Hsla, InputHandler,
+    InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
+    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
@@ -5010,6 +5011,50 @@ impl Window {
             corner_radii,
             tile: sub_tile,
             opacity,
+        });
+        Ok(())
+    }
+
+    /// Registers an application painter on this window's GPU backend.
+    ///
+    /// Returns an error if the backend cannot provide direct GPU drawing.
+    /// The returned handle can only be used with this window.
+    pub fn register_gpu_painter(&mut self, painter: impl GpuPainter) -> Result<GpuPainterHandle> {
+        let (handle, registration) = GpuPainterHandle::new(self.handle, painter);
+        self.platform_window.register_gpu_painter(registration)?;
+        Ok(handle)
+    }
+
+    /// Queues application GPU drawing at the current z-index.
+    ///
+    /// Call during the paint phase of element drawing. The scene retains `data` for
+    /// the backend's drawing callback, including when a cached scene is replayed. This method
+    /// does not invoke the painter immediately.
+    ///
+    /// Returns an error if `handle` was registered with another window.
+    pub fn paint_gpu(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        handle: &GpuPainterHandle,
+        data: Arc<dyn Any + Send + Sync>,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+        anyhow::ensure!(
+            handle.owner().window_id() == self.handle.window_id(),
+            "GPU painter belongs to another window"
+        );
+        let scale_factor = self.scale_factor();
+        let opacity = self.element_opacity();
+        self.next_frame.scene.insert_gpu_paint(GpuPaintSurface {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            draw: GpuPaintPrimitive {
+                handle: handle.clone(),
+                data,
+                scale_factor,
+                opacity,
+            },
         });
         Ok(())
     }

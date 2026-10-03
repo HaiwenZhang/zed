@@ -2119,6 +2119,13 @@ impl PlatformWindow for MacWindow {
         self.0.lock().renderer.sprite_atlas().clone()
     }
 
+    fn register_gpu_painter(
+        &self,
+        registration: gpui::GpuPainterRegistration,
+    ) -> anyhow::Result<()> {
+        self.0.lock().renderer.register_gpu_painter(registration)
+    }
+
     fn gpu_specs(&self) -> Option<gpui::GpuSpecs> {
         None
     }

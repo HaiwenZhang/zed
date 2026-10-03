@@ -2165,6 +2165,17 @@ impl PlatformWindow for WaylandWindow {
         state.client.update_ime_position(bounds);
     }
 
+    fn register_gpu_painter(
+        &self,
+        registration: gpui::GpuPainterRegistration,
+    ) -> anyhow::Result<()> {
+        self.borrow()
+            .renderer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("window renderer is unavailable"))?
+            .register_gpu_painter(registration)
+    }
+
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.borrow().renderer.as_ref()?.gpu_specs()
     }

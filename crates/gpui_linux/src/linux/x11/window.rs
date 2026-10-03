@@ -1972,6 +1972,19 @@ impl PlatformWindow for X11Window {
         client.update_ime_position(bounds);
     }
 
+    fn register_gpu_painter(
+        &self,
+        registration: gpui::GpuPainterRegistration,
+    ) -> anyhow::Result<()> {
+        self.0
+            .state
+            .borrow()
+            .renderer
+            .as_ref()
+            .context("window renderer is unavailable")?
+            .register_gpu_painter(registration)
+    }
+
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.0.state.borrow().renderer.as_ref()?.gpu_specs()
     }
