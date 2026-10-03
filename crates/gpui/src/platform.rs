@@ -1030,6 +1030,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
 
+    fn register_gpu_painter(&self, _registration: crate::GpuPainterRegistration) -> Result<()> {
+        anyhow::bail!("GPU painters are unavailable on this platform window")
+    }
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
     // Mobile platform methods.

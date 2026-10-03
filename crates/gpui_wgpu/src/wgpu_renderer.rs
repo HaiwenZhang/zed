@@ -1,11 +1,14 @@
+use crate::gpu_painter::{WgpuPaintContext, WgpuPainterAdapter};
 use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuPainterRegistration, GpuPainterRegistry,
+    GpuResetReason, GpuSpecs, Path, Point, PrimitiveBatch, ScaledPixels, Scene, SceneBatch, Size,
+    get_gamma_correction_ratios,
 };
+use gpui_util::ResultExt;
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -244,6 +247,8 @@ enum RendererState {
 }
 
 pub struct WgpuRenderer {
+    // Notify painters before the device and frame resources are dropped.
+    gpu_painters: GpuPainterRegistry,
     /// Shared GPU context for device recovery coordination (unused on WASM).
     #[allow(dead_code)]
     context: Option<GpuContext>,
@@ -477,6 +482,7 @@ impl WgpuRenderer {
             device_errors: Arc::clone(context.errors()),
             observed_error_generation: 0,
             last_surface_error: None,
+            gpu_painters: GpuPainterRegistry::default(),
             needs_redraw: false,
         })
     }
@@ -1468,7 +1474,7 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        self.record_frame(scene, target_view, clear_color)
+        self.record_frame(scene, target_view, size, clear_color)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
                 self.resources.queue.submit(std::iter::empty());
@@ -1479,6 +1485,7 @@ impl WgpuRendererCore {
         &mut self,
         scene: &Scene,
         frame_view: &wgpu::TextureView,
+        size: Size<DevicePixels>,
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
         let mut instance_offset = 0;
@@ -1521,7 +1528,55 @@ impl WgpuRendererCore {
                 ..Default::default()
             });
 
-            for batch in scene.batches() {
+            for batch in scene.render_batches() {
+                let batch = match batch {
+                    SceneBatch::Primitive(batch) => batch,
+                    SceneBatch::GpuPaints(range) => {
+                        drop(pass);
+                        for surface in &scene.gpu_paints[range] {
+                            let draw = &surface.draw;
+
+                            let target = draw.target(
+                                [size.width.0 as u32, size.height.0 as u32],
+                                surface.bounds,
+                                surface.content_mask,
+                                1,
+                            );
+                            if target.clip.size.width.0 > 0.0 && target.clip.size.height.0 > 0.0 {
+                                draw.handle
+                                    .invoke::<WgpuPainterAdapter>(|painter| {
+                                        painter.0.paint(
+                                            &mut WgpuPaintContext {
+                                                target,
+                                                device: &self.resources().device,
+                                                encoder: &mut encoder,
+                                                color_target: frame_view,
+                                                color_format: self.target_format,
+                                            },
+                                            draw.data.as_ref(),
+                                        )
+                                    })
+                                    .log_err();
+                            }
+                        }
+                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("main_pass_after_gpu_painter"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: frame_view,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            ..Default::default()
+                        });
+
+                        continue;
+                    }
+                };
                 match batch {
                     PrimitiveBatch::Quads(range) => self.draw_instances(
                         &instance_bindings.quads,
@@ -2183,7 +2238,17 @@ impl WgpuRenderer {
         Ok(())
     }
 
+    pub fn register_gpu_painter(&self, registration: GpuPainterRegistration) -> Result<()> {
+        anyhow::ensure!(
+            registration.is::<WgpuPainterAdapter>(),
+            "GPU painter is incompatible with this backend"
+        );
+        self.gpu_painters.register(registration);
+        Ok(())
+    }
+
     pub fn destroy(&mut self) {
+        self.gpu_painters.reset(GpuResetReason::WindowDestroyed);
         // Release surface-bound GPU resources eagerly so the underlying native
         // window can be destroyed before the renderer itself is dropped.
         self.state = RendererState::Released;
@@ -2212,6 +2277,7 @@ impl WgpuRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
     {
+        self.gpu_painters.reset(GpuResetReason::DeviceReplaced);
         let gpu_context = self.context.as_ref().expect("recover requires gpu_context");
 
         // Check if another window already recovered the context
@@ -2265,7 +2331,7 @@ impl WgpuRenderer {
         self.atlas.handle_device_lost(context);
 
         let is_bgr = self.is_bgr;
-        *self = Self::new_internal(
+        let mut replacement = Self::new_internal(
             Some(gpu_context.clone()),
             context,
             surface,
@@ -2273,6 +2339,9 @@ impl WgpuRenderer {
             self.compositor_gpu,
             self.atlas.clone(),
         )?;
+        // Keep registrations alive without sending WindowDestroyed when the old renderer drops.
+        replacement.gpu_painters = std::mem::take(&mut self.gpu_painters);
+        *self = replacement;
         self.set_subpixel_layout(is_bgr);
 
         log::info!("GPU recovery complete");

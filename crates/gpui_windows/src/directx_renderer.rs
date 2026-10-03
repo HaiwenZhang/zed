@@ -1,3 +1,4 @@
+use crate::gpu_painter::{D3D11PaintContext, D3D11PainterAdapter};
 use std::{
     slice,
     sync::{Arc, OnceLock},
@@ -54,6 +55,8 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+    gpu_painters: GpuPainterRegistry,
+    gpu_painter_state: Option<ID3DDeviceContextState>,
 }
 
 /// Direct3D objects
@@ -194,6 +197,8 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            gpu_painters: GpuPainterRegistry::default(),
+            gpu_painter_state: None,
         })
     }
 
@@ -261,6 +266,8 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
+        self.gpu_painters.reset(GpuResetReason::DeviceReplaced);
+        self.gpu_painter_state = None;
         let disable_direct_composition = self.direct_composition.is_none();
 
         unsafe {
@@ -362,7 +369,14 @@ impl DirectXRenderer {
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
-        for batch in scene.batches() {
+        for batch in scene.render_batches() {
+            let batch = match batch {
+                SceneBatch::Primitive(batch) => batch,
+                SceneBatch::GpuPaints(range) => {
+                    self.draw_gpu_paints(&scene.gpu_paints[range])?;
+                    continue;
+                }
+            };
             let _annotation = annotation
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
@@ -813,9 +827,101 @@ impl DirectXRenderer {
         )
     }
 
+    pub(crate) fn register_gpu_painter(
+        &mut self,
+        registration: GpuPainterRegistration,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            registration.is::<D3D11PainterAdapter>(),
+            "GPU painter is incompatible with this backend"
+        );
+        self.ensure_gpu_painter_state()?;
+        self.gpu_painters.register(registration);
+        Ok(())
+    }
+
+    fn ensure_gpu_painter_state(&mut self) -> Result<()> {
+        if self.gpu_painter_state.is_none() {
+            let device = &self.devices.as_ref().context("devices missing")?.device;
+            let device1: ID3D11Device1 = device.cast()?;
+            unsafe {
+                device1.CreateDeviceContextState(
+                    if device.GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED.0 as u32 != 0
+                    {
+                        D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED.0 as u32
+                    } else {
+                        0
+                    },
+                    &[device.GetFeatureLevel()],
+                    D3D11_SDK_VERSION,
+                    &ID3D11Device::IID,
+                    None,
+                    Some(&mut self.gpu_painter_state),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
         if surfaces.is_empty() {
             return Ok(());
+        }
+        Ok(())
+    }
+
+    fn draw_gpu_paints(&mut self, surfaces: &[GpuPaintSurface]) -> Result<()> {
+        for surface in surfaces {
+            let draw = &surface.draw;
+            let target = draw.target(
+                [self.width, self.height],
+                surface.bounds,
+                surface.content_mask,
+                1,
+            );
+            if target.clip.size.width.0 <= 0.0 || target.clip.size.height.0 <= 0.0 {
+                continue;
+            }
+            self.ensure_gpu_painter_state()?;
+            let devices = self.devices.as_ref().context("devices missing")?;
+            let resources = self.resources.as_ref().context("resources missing")?;
+            let color_target = resources
+                .render_target_view
+                .as_ref()
+                .context("color target missing")?;
+            let context: ID3D11DeviceContext1 = devices.device_context.cast()?;
+            let mut previous = None;
+            unsafe {
+                context.SwapDeviceContextState(
+                    self.gpu_painter_state
+                        .as_ref()
+                        .context("painter state missing")?,
+                    Some(&mut previous),
+                );
+            }
+            let _restore = GpuPainterStateRestore { context, previous };
+            unsafe {
+                devices
+                    .device_context
+                    .OMSetRenderTargets(Some(&[Some(color_target.clone())]), None);
+                devices
+                    .device_context
+                    .RSSetViewports(Some(&[resources.viewport]));
+            }
+            draw.handle
+                .invoke::<D3D11PainterAdapter>(|painter| {
+                    painter.0.paint(
+                        &mut D3D11PaintContext {
+                            target,
+                            device: &devices.device,
+                            context: &devices.device_context,
+                            color_target,
+                            color_format: RENDER_TARGET_FORMAT,
+                        },
+                        draw.data.as_ref(),
+                    )
+                })
+                .log_err();
         }
         Ok(())
     }
@@ -1283,6 +1389,8 @@ struct PathSprite {
 
 impl Drop for DirectXRenderer {
     fn drop(&mut self) {
+        self.gpu_painters.reset(GpuResetReason::WindowDestroyed);
+        self.gpu_painter_state = None;
         #[cfg(debug_assertions)]
         if let Some(devices) = &self.devices {
             report_live_objects(&devices.device).ok();
@@ -2066,5 +2174,22 @@ mod dxgi {
             (number >> 16) & 0xFFFF,
             number & 0xFFFF
         ))
+    }
+}
+
+struct GpuPainterStateRestore {
+    context: ID3D11DeviceContext1,
+    previous: Option<ID3DDeviceContextState>,
+}
+
+impl Drop for GpuPainterStateRestore {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            unsafe {
+                // Release application target bindings so they cannot prevent swapchain resize.
+                self.context.ClearState();
+                self.context.SwapDeviceContextState(previous, None);
+            }
+        }
     }
 }
