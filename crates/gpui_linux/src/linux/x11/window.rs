@@ -1972,8 +1972,6 @@ impl PlatformWindow for X11Window {
             .state
             .borrow()
             .renderer
-            .as_ref()
-            .context("window renderer is unavailable")?
             .register_gpu_painter(registration)
     }
 

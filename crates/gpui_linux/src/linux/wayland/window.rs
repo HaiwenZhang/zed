@@ -2137,11 +2137,7 @@ impl PlatformWindow for WaylandWindow {
         &self,
         registration: gpui::GpuPainterRegistration,
     ) -> anyhow::Result<()> {
-        self.borrow()
-            .renderer
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("window renderer is unavailable"))?
-            .register_gpu_painter(registration)
+        self.borrow().renderer.register_gpu_painter(registration)
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
