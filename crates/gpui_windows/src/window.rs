@@ -1052,6 +1052,14 @@ impl PlatformWindow for WindowsWindow {
         self.0.hwnd
     }
 
+    fn register_gpu_painter(&self, registration: GpuPainterRegistration) -> anyhow::Result<()> {
+        self.state
+            .renderer
+            .borrow_mut()
+            .register_gpu_painter(registration)?;
+        Ok(())
+    }
+
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.state.renderer.borrow().gpu_specs().log_err()
     }

@@ -50,6 +50,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub gpu_paints: Vec<GpuPaintSurface>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +67,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.gpu_paints.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -138,10 +140,27 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Inserts application drawing with the current layer order and content mask.
+    pub fn insert_gpu_paint(&mut self, mut surface: GpuPaintSurface) {
+        let bounds = surface.bounds.intersect(&surface.content_mask.bounds);
+        if bounds.is_empty() {
+            return;
+        }
+        surface.order = self
+            .layer_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.primitive_bounds.insert(bounds));
+        self.gpu_paints.push(surface.clone());
+        self.paint_operations
+            .push(PaintOperation::GpuPaint(surface));
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::GpuPaint(surface) => self.insert_gpu_paint(surface.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
@@ -160,6 +179,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.gpu_paints.sort_by_key(|surface| surface.order);
     }
 
     #[cfg_attr(
@@ -169,7 +189,17 @@ impl Scene {
         ),
         allow(dead_code)
     )]
+    /// Returns built-in primitive batches, omitting application GPU drawing.
+    /// Use [`Self::render_batches`] to render the complete scene.
     pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
+        self.render_batches().filter_map(|batch| match batch {
+            SceneBatch::Primitive(batch) => Some(batch),
+            SceneBatch::GpuPaints(_) => None,
+        })
+    }
+
+    /// Returns built-in and application GPU batches in scene draw order.
+    pub fn render_batches(&self) -> impl Iterator<Item = SceneBatch> + '_ {
         BatchIterator {
             shadows_start: 0,
             shadows_iter: self.shadows.iter().peekable(),
@@ -187,6 +217,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            gpu_paints_start: 0,
+            gpu_paints_iter: self.gpu_paints.iter().peekable(),
         }
     }
 }
@@ -209,10 +241,12 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    GpuPaint,
 }
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
+    GpuPaint(GpuPaintSurface),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
 }
@@ -283,10 +317,12 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    gpu_paints_start: usize,
+    gpu_paints_iter: Peekable<slice::Iter<'a, GpuPaintSurface>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
-    type Item = PrimitiveBatch;
+    type Item = SceneBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut orders_and_kinds = [
@@ -316,6 +352,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
             ),
+            (
+                self.gpu_paints_iter.peek().map(|surface| surface.order),
+                PrimitiveKind::GpuPaint,
+            ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
 
@@ -328,6 +368,20 @@ impl<'a> Iterator for BatchIterator<'a> {
         };
 
         match batch_kind {
+            PrimitiveKind::GpuPaint => {
+                let start = self.gpu_paints_start;
+                let mut end = start + 1;
+                self.gpu_paints_iter.next();
+                while self
+                    .gpu_paints_iter
+                    .next_if(|surface| (surface.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    end += 1;
+                }
+                self.gpu_paints_start = end;
+                return Some(SceneBatch::GpuPaints(start..end));
+            }
             PrimitiveKind::Shadow => {
                 let shadows_start = self.shadows_start;
                 let mut shadows_end = shadows_start + 1;
@@ -462,7 +516,17 @@ impl<'a> Iterator for BatchIterator<'a> {
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
         }
+        .map(SceneBatch::Primitive)
     }
+}
+
+/// Ordered rendering batches, including application GPU drawing.
+#[derive(Debug)]
+pub enum SceneBatch {
+    /// An existing GPUI primitive batch.
+    Primitive(PrimitiveBatch),
+    /// A range of application drawing commands in [`Scene::gpu_paints`].
+    GpuPaints(Range<usize>),
 }
 
 #[derive(Debug)]
@@ -761,6 +825,19 @@ impl From<PolychromeSprite> for Primitive {
     fn from(sprite: PolychromeSprite) -> Self {
         Primitive::PolychromeSprite(sprite)
     }
+}
+
+/// An application GPU drawing command with scene ordering and clipping.
+#[derive(Clone, Debug)]
+pub struct GpuPaintSurface {
+    /// Ordering assigned by the scene.
+    pub order: DrawOrder,
+    /// Physical element bounds.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Inherited physical clipping bounds.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Painter and immutable frame snapshot.
+    pub draw: crate::GpuPaintPrimitive,
 }
 
 #[derive(Clone, Debug)]

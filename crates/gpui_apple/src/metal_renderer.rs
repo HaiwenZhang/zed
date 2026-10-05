@@ -1,11 +1,14 @@
+use crate::gpu_painter::{MetalPaintContext, MetalPainterAdapter};
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, GpuPainterRegistration,
+    GpuPainterRegistry, GpuResetReason, PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels,
+    Scene, SceneBatch, Size, point, size,
 };
+use gpui_util::ResultExt;
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
 use objc2::runtime::AnyObject;
@@ -107,6 +110,8 @@ impl InstanceBufferPool {
 }
 
 pub struct MetalRenderer {
+    // Notify painters before the device and frame resources are dropped.
+    gpu_painters: GpuPainterRegistry,
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
     is_apple_gpu: bool,
@@ -387,6 +392,7 @@ impl MetalRenderer {
             core_video_texture_cache,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
+            gpu_painters: GpuPainterRegistry::default(),
             path_sample_count: PATH_SAMPLE_COUNT,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
@@ -467,8 +473,17 @@ impl MetalRenderer {
         }
     }
 
+    pub fn register_gpu_painter(&self, registration: GpuPainterRegistration) -> Result<()> {
+        anyhow::ensure!(
+            registration.is::<MetalPainterAdapter>(),
+            "GPU painter is incompatible with this backend"
+        );
+        self.gpu_painters.register(registration);
+        Ok(())
+    }
+
     pub fn destroy(&self) {
-        // nothing to do
+        self.gpu_painters.reset(GpuResetReason::WindowDestroyed);
     }
 
     pub fn draw(&mut self, scene: &Scene) {
@@ -710,7 +725,46 @@ impl MetalRenderer {
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
 
-        for batch in scene.batches() {
+        for batch in scene.render_batches() {
+            let batch = match batch {
+                SceneBatch::Primitive(batch) => batch,
+                SceneBatch::GpuPaints(range) => {
+                    for surface in &scene.gpu_paints[range] {
+                        let draw = &surface.draw;
+
+                        command_encoder.end_encoding();
+                        let target = draw.target(
+                            [texture.width() as u32, texture.height() as u32],
+                            surface.bounds,
+                            surface.content_mask,
+                            texture.sample_count() as u32,
+                        );
+                        if target.clip.size.width.0 > 0.0 && target.clip.size.height.0 > 0.0 {
+                            draw.handle
+                                .invoke::<MetalPainterAdapter>(|painter| {
+                                    painter.0.paint(
+                                        &mut MetalPaintContext {
+                                            target,
+                                            device: &self.device,
+                                            command_buffer,
+                                            color_target: texture,
+                                            color_format: texture.pixel_format(),
+                                        },
+                                        draw.data.as_ref(),
+                                    )
+                                })
+                                .log_err();
+                        }
+                        command_encoder = new_command_encoder_for_texture(
+                            command_buffer,
+                            texture,
+                            viewport_size,
+                            None,
+                        );
+                    }
+                    continue;
+                }
+            };
             match batch {
                 PrimitiveBatch::Shadows(range) => {
                     self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
