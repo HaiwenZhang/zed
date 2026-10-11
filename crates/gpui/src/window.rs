@@ -5031,6 +5031,10 @@ impl Window {
     /// the backend's drawing callback, including when a cached scene is replayed. This method
     /// does not invoke the painter immediately.
     ///
+    /// Native backends prepare visible surfaces before ordinary scene drawing,
+    /// then invoke their drawing callbacks in scene order. A painter may draw
+    /// directly into the frame or composite an application-owned offscreen target.
+    ///
     /// Returns an error if `handle` was registered with another window.
     pub fn paint_gpu(
         &mut self,

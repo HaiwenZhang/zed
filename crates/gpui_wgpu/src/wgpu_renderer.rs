@@ -1,12 +1,12 @@
-use crate::gpu_painter::{WgpuPaintContext, WgpuPainterAdapter};
+use crate::gpu_painter::{WgpuPaintContext, WgpuPainterAdapter, WgpuPrepareContext};
 use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuPainterRegistration, GpuPainterRegistry,
-    GpuResetReason, GpuSpecs, Path, Point, PrimitiveBatch, ScaledPixels, Scene, SceneBatch, Size,
-    get_gamma_correction_ratios,
+    GpuPreparationPhase, GpuResetReason, GpuSpecs, Path, Point, PrimitiveBatch, ScaledPixels,
+    Scene, SceneBatch, Size, get_gamma_correction_ratios, prepare_gpu_paints,
 };
 use gpui_util::ResultExt;
 use log::warn;
@@ -1512,6 +1512,29 @@ impl WgpuRendererCore {
                     label: Some("main_encoder"),
                 });
 
+        let preparation = prepare_gpu_paints::<WgpuPainterAdapter>(
+            &scene.gpu_paints,
+            [size.width.0 as u32, size.height.0 as u32],
+            1,
+            |painter, draw, target, phase| {
+                let mut context = WgpuPrepareContext {
+                    target,
+                    device: &self.resources().device,
+                    queue: &self.resources().queue,
+                    encoder: &mut encoder,
+                    color_format: self.target_format,
+                };
+                match phase {
+                    GpuPreparationPhase::Prepare => {
+                        painter.0.prepare(&mut context, draw.data.as_ref())
+                    }
+                    GpuPreparationPhase::FinishPrepare => {
+                        painter.0.finish_prepare(&mut context, draw.data.as_ref())
+                    }
+                }
+            },
+        );
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
@@ -1533,7 +1556,11 @@ impl WgpuRendererCore {
                     SceneBatch::Primitive(batch) => batch,
                     SceneBatch::GpuPaints(range) => {
                         drop(pass);
-                        for surface in &scene.gpu_paints[range] {
+                        for (offset, surface) in scene.gpu_paints[range.clone()].iter().enumerate()
+                        {
+                            if !preparation.is_ready(range.start + offset) {
+                                continue;
+                            }
                             let draw = &surface.draw;
 
                             let target = draw.target(

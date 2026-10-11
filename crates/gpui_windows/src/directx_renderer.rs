@@ -1,4 +1,4 @@
-use crate::gpu_painter::{D3D11PaintContext, D3D11PainterAdapter};
+use crate::gpu_painter::{D3D11PaintContext, D3D11PainterAdapter, D3D11PrepareContext};
 use std::{
     slice,
     sync::{Arc, OnceLock},
@@ -364,6 +364,33 @@ impl DirectXRenderer {
         })?;
         self.upload_scene_buffers(scene)?;
 
+        let preparation = prepare_gpu_paints::<D3D11PainterAdapter>(
+            &scene.gpu_paints,
+            [self.width, self.height],
+            1,
+            |painter, draw, target, phase| {
+                let _restore = self.enter_gpu_painter()?;
+                let devices = self.devices.as_ref().context("devices missing")?;
+                unsafe {
+                    devices.device_context.OMSetRenderTargets(None, None);
+                }
+                let mut context = D3D11PrepareContext {
+                    target,
+                    device: &devices.device,
+                    context: &devices.device_context,
+                    color_format: RENDER_TARGET_FORMAT,
+                };
+                match phase {
+                    GpuPreparationPhase::Prepare => {
+                        painter.0.prepare(&mut context, draw.data.as_ref())
+                    }
+                    GpuPreparationPhase::FinishPrepare => {
+                        painter.0.finish_prepare(&mut context, draw.data.as_ref())
+                    }
+                }
+            },
+        );
+
         let annotation = self
             .devices
             .as_ref()
@@ -373,7 +400,7 @@ impl DirectXRenderer {
             let batch = match batch {
                 SceneBatch::Primitive(batch) => batch,
                 SceneBatch::GpuPaints(range) => {
-                    self.draw_gpu_paints(&scene.gpu_paints[range])?;
+                    self.draw_gpu_paints(scene, range, &preparation)?;
                     continue;
                 }
             };
@@ -870,8 +897,32 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    fn draw_gpu_paints(&mut self, surfaces: &[GpuPaintSurface]) -> Result<()> {
-        for surface in surfaces {
+    fn enter_gpu_painter(&mut self) -> Result<GpuPainterStateRestore> {
+        self.ensure_gpu_painter_state()?;
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let context: ID3D11DeviceContext1 = devices.device_context.cast()?;
+        let mut previous = None;
+        unsafe {
+            context.SwapDeviceContextState(
+                self.gpu_painter_state
+                    .as_ref()
+                    .context("painter state missing")?,
+                Some(&mut previous),
+            );
+        }
+        Ok(GpuPainterStateRestore { context, previous })
+    }
+
+    fn draw_gpu_paints(
+        &mut self,
+        scene: &Scene,
+        range: std::ops::Range<usize>,
+        preparation: &GpuPaintPreparation,
+    ) -> Result<()> {
+        for (offset, surface) in scene.gpu_paints[range.clone()].iter().enumerate() {
+            if !preparation.is_ready(range.start + offset) {
+                continue;
+            }
             let draw = &surface.draw;
             let target = draw.target(
                 [self.width, self.height],
@@ -882,24 +933,13 @@ impl DirectXRenderer {
             if target.clip.size.width.0 <= 0.0 || target.clip.size.height.0 <= 0.0 {
                 continue;
             }
-            self.ensure_gpu_painter_state()?;
+            let _restore = self.enter_gpu_painter()?;
             let devices = self.devices.as_ref().context("devices missing")?;
             let resources = self.resources.as_ref().context("resources missing")?;
             let color_target = resources
                 .render_target_view
                 .as_ref()
                 .context("color target missing")?;
-            let context: ID3D11DeviceContext1 = devices.device_context.cast()?;
-            let mut previous = None;
-            unsafe {
-                context.SwapDeviceContextState(
-                    self.gpu_painter_state
-                        .as_ref()
-                        .context("painter state missing")?,
-                    Some(&mut previous),
-                );
-            }
-            let _restore = GpuPainterStateRestore { context, previous };
             unsafe {
                 devices
                     .device_context

@@ -1,12 +1,12 @@
-use crate::gpu_painter::{MetalPaintContext, MetalPainterAdapter};
+use crate::gpu_painter::{MetalPaintContext, MetalPainterAdapter, MetalPrepareContext};
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, GpuPainterRegistration,
-    GpuPainterRegistry, GpuResetReason, PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels,
-    Scene, SceneBatch, Size, point, size,
+    GpuPainterRegistry, GpuPreparationPhase, GpuResetReason, PaintSurface, Path, Point,
+    PrimitiveBatch, ScaledPixels, Scene, SceneBatch, Size, point, prepare_gpu_paints, size,
 };
 use gpui_util::ResultExt;
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -716,6 +716,27 @@ impl MetalRenderer {
     ) -> Result<metal::CommandBuffer> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
+        let preparation = prepare_gpu_paints::<MetalPainterAdapter>(
+            &scene.gpu_paints,
+            [texture.width() as u32, texture.height() as u32],
+            texture.sample_count() as u32,
+            |painter, draw, target, phase| {
+                let mut context = MetalPrepareContext {
+                    target,
+                    device: &self.device,
+                    command_buffer,
+                    color_format: texture.pixel_format(),
+                };
+                match phase {
+                    GpuPreparationPhase::Prepare => {
+                        painter.0.prepare(&mut context, draw.data.as_ref())
+                    }
+                    GpuPreparationPhase::FinishPrepare => {
+                        painter.0.finish_prepare(&mut context, draw.data.as_ref())
+                    }
+                }
+            },
+        );
         let alpha = if self.opaque { 1. } else { 0. };
 
         let mut command_encoder = new_command_encoder_for_texture(
@@ -729,7 +750,10 @@ impl MetalRenderer {
             let batch = match batch {
                 SceneBatch::Primitive(batch) => batch,
                 SceneBatch::GpuPaints(range) => {
-                    for surface in &scene.gpu_paints[range] {
+                    for (offset, surface) in scene.gpu_paints[range.clone()].iter().enumerate() {
+                        if !preparation.is_ready(range.start + offset) {
+                            continue;
+                        }
                         let draw = &surface.draw;
 
                         command_encoder.end_encoding();

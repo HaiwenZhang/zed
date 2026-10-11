@@ -83,6 +83,69 @@ GPUI offers three different [registers](<https://en.wikipedia.org/wiki/Register_
 
 Each of these registers has one or more corresponding contexts that can be accessed from all GPUI services. This context is your main interface to GPUI, and is used extensively throughout the framework.
 
+## Custom GPU rendering
+
+Register a backend painter with `Window::register_gpu_painter`, then call
+`Window::paint_gpu(bounds, &handle, snapshot)` during an element's paint phase.
+The handle belongs to one window. The scene retains the immutable snapshot and
+draws the surface in order with ordinary UI primitives, including cached scene
+replays.
+
+The native interfaces are `gpui_apple::MetalPainter`, `gpui_wgpu::WgpuPainter`
+and `gpui_windows::D3D11Painter`, adapted with `metal_painter`, `wgpu_painter`
+and `d3d11_painter`. Each supports these stages:
+
+| Stage | Execution | Typical work |
+| --- | --- | --- |
+| `prepare` | Before ordinary scene drawing, once per visible surface | Upload geometry, allocate targets, run compute or offscreen passes |
+| `finish_prepare` | After all surfaces have prepared, once per successfully prepared surface | Work that depends on preparation of other surfaces |
+| `paint` | At the surface's position in the scene | Draw directly or composite an offscreen result |
+
+Preparation methods default to success without doing any work. Existing painters
+implementing only `paint` and `reset` continue to work. A preparation error skips
+the surface's remaining stages; errors are logged and available through
+`GpuPainterHandle::status()`. Its `encoded` counter counts successful `paint`
+callbacks, not preparation or GPU completion.
+
+For direct rendering, use the provided command encoder/buffer or D3D11 context
+to create your own pass targeting the window's color attachment. Preserve its
+existing contents, obey `target.clip`, and apply `target.opacity`. An
+application-owned depth attachment must match the color target's full dimensions
+and `target.sample_count`. The pipeline must also match the target format and
+sample count. GPUI resumes ordinary UI rendering after your callback.
+
+For an offscreen CAD viewport, own the color, depth, multisample and any picking
+attachments in your painter. Render them during preparation, resolve multisampled
+color if needed, and composite the result during `paint`. Offscreen attachments
+can use a different resolution and sample count from the window. Apply clipping
+and inherited opacity during the final composition. Additional passes can also
+be encoded during `paint` when they must execute at that position in the scene.
+GPUI does not supply a CAD renderer or manage these application-owned attachments.
+Direct and offscreen surfaces can coexist in the same window. Both paths can
+update every frame; offscreen rendering additionally allows reuse of a completed
+texture when viewport content has not changed.
+
+Callbacks execute serially. Never submit or present the frame, reenter GPUI,
+retain borrowed frame targets, or leave an application encoder active on return,
+including error returns. Encoding is not GPU completion: caches and asynchronous
+readbacks must account for frames that fail or are abandoned before submission.
+Keep separate resources or buffer ranges for different snapshots when multiple
+surfaces share a painter. Preparation runs again on scene replays and encoding
+retries. On device replacement, `reset` releases resources and subsequent callbacks
+recreate them on the supplied device; resize alone does not invoke `reset`.
+
+The macOS Metal example demonstrates an animated, depth-tested viewport with
+switchable direct and offscreen rendering, MSAA resolve, clipping, opacity and
+offscreen caching. Run it from the repository root:
+
+```sh
+cargo run -p gpui_apple --example cad_viewport --features runtime_shaders
+```
+
+Click the rendering mode to switch paths and pause animation to reuse the
+offscreen result. The example uses one painter for one viewport; multiple
+independent viewports can each register their own painter.
+
 ## Other Resources
 
 In addition to the systems above, GPUI provides a range of smaller services that are useful for building complex applications:

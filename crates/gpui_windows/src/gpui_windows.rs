@@ -39,7 +39,7 @@ pub(crate) use vsync::*;
 pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
-pub use gpu_painter::{D3D11PaintContext, D3D11Painter, d3d11_painter};
+pub use gpu_painter::{D3D11PaintContext, D3D11Painter, D3D11PrepareContext, d3d11_painter};
 pub use platform::WindowsPlatform;
 
 pub(crate) use windows::Win32::Foundation::HWND;
