@@ -1,5 +1,5 @@
 use anyhow::Result;
-use gpui::{GpuPaintTarget, GpuPainter, GpuResetReason};
+use gpui::{GpuDrawMode, GpuPaintTarget, GpuPainter, GpuResetReason};
 use std::any::Any;
 
 /// Native Metal resources borrowed before scene drawing begins.
@@ -14,6 +14,22 @@ pub struct MetalPrepareContext<'a> {
     /// Commands recorded here execute before ordinary scene drawing.
     pub command_buffer: &'a metal::CommandBufferRef,
     /// Color format of the eventual drawing target.
+    pub color_format: metal::MTLPixelFormat,
+}
+
+/// Native Metal drawing access within GPUI's current UI pass.
+///
+/// GPUI sets the viewport and scissor before drawing. Attachments cannot be
+/// replaced; use [`GpuDrawMode::OwnPass`] for depth, multisampling or other passes.
+/// Do not end the pass, retain its resources, or reenter GPUI.
+pub struct MetalDrawContext<'a> {
+    /// Target geometry and inherited opacity; apply opacity when writing color.
+    pub target: GpuPaintTarget,
+    /// Resources must be created on this device.
+    pub device: &'a metal::DeviceRef,
+    /// Current UI drawing pass, borrowed only for this callback.
+    pub encoder: &'a metal::RenderCommandEncoderRef,
+    /// Color interpretation used by the target.
     pub color_format: metal::MTLPixelFormat,
 }
 
@@ -59,7 +75,29 @@ pub trait MetalPainter: Send + 'static {
         Ok(())
     }
 
-    /// Encodes drawing into the current frame.
+    /// Selects access after this surface finishes preparation.
+    ///
+    /// This method only selects a mode; it must not encode drawing or reenter GPUI.
+    /// The default preserves existing independent-pass painters.
+    fn draw_mode(&self, _data: &(dyn Any + Send + Sync)) -> GpuDrawMode {
+        GpuDrawMode::OwnPass
+    }
+
+    /// Draws into the existing UI pass when [`Self::draw_mode`] selects shared access.
+    ///
+    /// Apply `context.target.opacity` and preserve GPUI's existing color. GPUI
+    /// restores its drawing state after success or error. Do not end the pass,
+    /// leave queries active, retain frame resources, or reenter GPUI. Errors do not
+    /// undo commands already encoded and do not fall back to [`Self::paint`].
+    fn draw_in_pass(
+        &mut self,
+        _context: &mut MetalDrawContext<'_>,
+        _data: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        anyhow::bail!("Shared-pass drawing is not implemented by this painter")
+    }
+
+    /// Encodes independent passes when [`Self::draw_mode`] selects own-pass access.
     ///
     /// Preserve existing color, restrict writes to `context.target.clip`, and apply
     /// `context.target.opacity`. End application encoders before returning, including
@@ -69,9 +107,11 @@ pub trait MetalPainter: Send + 'static {
     /// another thread, or reenter GPUI. Success indicates encoding, not GPU completion.
     fn paint(
         &mut self,
-        context: &mut MetalPaintContext<'_>,
-        data: &(dyn Any + Send + Sync),
-    ) -> Result<()>;
+        _context: &mut MetalPaintContext<'_>,
+        _data: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        anyhow::bail!("Independent-pass drawing is not implemented by this painter")
+    }
 
     /// Releases resources before the window's device or renderer is retired.
     /// After device replacement, recreate resources in the next preparation or drawing callback.
@@ -86,6 +126,10 @@ pub fn metal_painter(painter: impl MetalPainter) -> impl GpuPainter {
 pub(crate) struct MetalPainterAdapter(pub(crate) Box<dyn MetalPainter>);
 
 impl GpuPainter for MetalPainterAdapter {
+    fn draw_mode(&self, data: &(dyn Any + Send + Sync)) -> GpuDrawMode {
+        self.0.draw_mode(data)
+    }
+
     fn reset(&mut self, reason: GpuResetReason) {
         self.0.reset(reason);
     }

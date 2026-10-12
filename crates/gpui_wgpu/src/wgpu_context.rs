@@ -202,7 +202,29 @@ impl WgpuContext {
         any(test, feature = "bench-support", feature = "test-support")
     ))]
     fn create_headless() -> anyhow::Result<(Self, wgpu::TextureFormat)> {
-        let instance = Self::instance(None);
+        Self::create_headless_with_instance(Self::instance(None))
+    }
+
+    #[cfg(all(test, not(target_family = "wasm")))]
+    pub(crate) fn new_headless_for_test(
+        backends: wgpu::Backends,
+    ) -> anyhow::Result<(Self, wgpu::TextureFormat)> {
+        Self::create_headless_with_instance(wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        }))
+    }
+
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(test, feature = "bench-support", feature = "test-support")
+    ))]
+    fn create_headless_with_instance(
+        instance: wgpu::Instance,
+    ) -> anyhow::Result<(Self, wgpu::TextureFormat)> {
         let device_id_filter = Self::device_id_filter();
         let (adapter, device, queue, dual_source_blending, color_texture_format, target_format) =
             gpui::block_on(async {

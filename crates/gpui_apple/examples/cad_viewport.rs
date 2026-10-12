@@ -4,10 +4,13 @@ mod macos {
     use block2::RcBlock;
     use foreign_types::ForeignTypeRef;
     use gpui::{
-        Bounds, Context, GpuPaintTarget, GpuPainterHandle, GpuResetReason, IntoElement, Render,
-        Styled, Window, WindowBounds, WindowOptions, canvas, div, prelude::*, px, rgb, size,
+        Bounds, Context, GpuDrawMode, GpuPaintTarget, GpuPainterHandle, GpuResetReason,
+        IntoElement, Render, Styled, Window, WindowBounds, WindowOptions, canvas, div, prelude::*,
+        px, rgb, size,
     };
-    use gpui_apple::{MetalPaintContext, MetalPainter, MetalPrepareContext, metal_painter};
+    use gpui_apple::{
+        MetalDrawContext, MetalPaintContext, MetalPainter, MetalPrepareContext, metal_painter,
+    };
     use gpui_util::ResultExt;
     use metal::{
         MTLBlendFactor, MTLClearColor, MTLCompareFunction, MTLLoadAction, MTLPixelFormat,
@@ -214,15 +217,12 @@ mod macos {
     }
 
     fn scissor(target: GpuPaintTarget) -> MTLScissorRect {
-        let left = target.clip.origin.x.0.ceil().max(0.0) as u64;
-        let top = target.clip.origin.y.0.ceil().max(0.0) as u64;
-        let right = target.clip.right().0.floor().max(left as f32) as u64;
-        let bottom = target.clip.bottom().0.floor().max(top as f32) as u64;
+        let [left, top, width, height] = target.scissor_rect();
         MTLScissorRect {
-            x: left,
-            y: top,
-            width: right - left,
-            height: bottom - top,
+            x: left as u64,
+            y: top as u64,
+            width: width as u64,
+            height: height as u64,
         }
     }
 
@@ -342,6 +342,48 @@ mod macos {
             Ok(())
         }
 
+        fn draw_mode(&self, data: &(dyn Any + Send + Sync)) -> GpuDrawMode {
+            match data
+                .downcast_ref::<Snapshot>()
+                .map(|snapshot| snapshot.mode)
+            {
+                Some(RenderMode::Offscreen) => GpuDrawMode::SharedPass,
+                _ => GpuDrawMode::OwnPass,
+            }
+        }
+
+        fn draw_in_pass(
+            &mut self,
+            context: &mut MetalDrawContext<'_>,
+            _data: &(dyn Any + Send + Sync),
+        ) -> Result<()> {
+            let resources = self.resources(
+                context.device,
+                context.color_format,
+                context.target.sample_count,
+            )?;
+            let offscreen = resources
+                .offscreen
+                .as_ref()
+                .context("offscreen target was not prepared")?;
+            context
+                .encoder
+                .set_render_pipeline_state(&resources.composite_pipeline);
+            context
+                .encoder
+                .set_fragment_texture(0, Some(&offscreen.color));
+            let opacity = context.target.opacity;
+            context.encoder.set_fragment_bytes(
+                0,
+                std::mem::size_of_val(&opacity) as u64,
+                (&opacity as *const f32).cast(),
+            );
+            context
+                .encoder
+                .draw_primitives(MTLPrimitiveType::Triangle, 0, 6);
+            Ok(())
+        }
+
         fn paint(
             &mut self,
             context: &mut MetalPaintContext<'_>,
@@ -350,11 +392,27 @@ mod macos {
             let snapshot = *data
                 .downcast_ref::<Snapshot>()
                 .context("CAD snapshot missing")?;
+            anyhow::ensure!(
+                snapshot.mode == RenderMode::Direct,
+                "offscreen composition requires shared-pass access"
+            );
             let resources = self.resources(
                 context.device,
                 context.color_format,
                 context.target.sample_count,
             )?;
+            if resources.direct_depth.as_ref().is_none_or(|depth| {
+                depth.width() != context.target.size[0] as u64
+                    || depth.height() != context.target.size[1] as u64
+            }) {
+                resources.direct_depth = Some(texture(
+                    context.device,
+                    context.target.size,
+                    MTLPixelFormat::Depth32Float,
+                    context.target.sample_count,
+                    MTLTextureUsage::RenderTarget,
+                ));
+            }
             let descriptor = metal::RenderPassDescriptor::new();
             let color = descriptor
                 .color_attachments()
@@ -363,36 +421,11 @@ mod macos {
             color.set_texture(Some(context.color_target));
             color.set_load_action(MTLLoadAction::Load);
             color.set_store_action(MTLStoreAction::Store);
-
-            if snapshot.mode == RenderMode::Direct {
-                if resources.direct_depth.as_ref().is_none_or(|depth| {
-                    depth.width() != context.target.size[0] as u64
-                        || depth.height() != context.target.size[1] as u64
-                }) {
-                    resources.direct_depth = Some(texture(
-                        context.device,
-                        context.target.size,
-                        MTLPixelFormat::Depth32Float,
-                        context.target.sample_count,
-                        MTLTextureUsage::RenderTarget,
-                    ));
-                }
-                let depth = descriptor.depth_attachment().context("depth attachment")?;
-                depth.set_texture(resources.direct_depth.as_deref());
-                depth.set_load_action(MTLLoadAction::Clear);
-                depth.set_clear_depth(1.0);
-                depth.set_store_action(MTLStoreAction::DontCare);
-            }
-            let offscreen = if snapshot.mode == RenderMode::Offscreen {
-                Some(
-                    resources
-                        .offscreen
-                        .as_ref()
-                        .context("offscreen target was not prepared")?,
-                )
-            } else {
-                None
-            };
+            let depth = descriptor.depth_attachment().context("depth attachment")?;
+            depth.set_texture(resources.direct_depth.as_deref());
+            depth.set_load_action(MTLLoadAction::Clear);
+            depth.set_clear_depth(1.0);
+            depth.set_store_action(MTLStoreAction::DontCare);
             let clip = scissor(context.target);
             if clip.width == 0 || clip.height == 0 {
                 return Ok(());
@@ -402,26 +435,14 @@ mod macos {
                 .new_render_command_encoder(&descriptor);
             encoder.set_viewport(viewport(context.target));
             encoder.set_scissor_rect(clip);
-            if let Some(offscreen) = offscreen {
-                encoder.set_render_pipeline_state(&resources.composite_pipeline);
-                encoder.set_fragment_texture(0, Some(&offscreen.color));
-                let opacity = context.target.opacity;
-                encoder.set_fragment_bytes(
-                    0,
-                    std::mem::size_of_val(&opacity) as u64,
-                    (&opacity as *const f32).cast(),
-                );
-                encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 6);
-            } else {
-                encode_cube(
-                    encoder,
-                    &resources.direct_pipeline,
-                    &resources.depth_state,
-                    snapshot,
-                    context.target.bounds.size.width.0 / context.target.bounds.size.height.0,
-                    context.target.opacity,
-                );
-            }
+            encode_cube(
+                encoder,
+                &resources.direct_pipeline,
+                &resources.depth_state,
+                snapshot,
+                context.target.bounds.size.width.0 / context.target.bounds.size.height.0,
+                context.target.opacity,
+            );
             encoder.end_encoding();
             Ok(())
         }
@@ -431,10 +452,14 @@ mod macos {
         }
     }
 
-    struct CadViewport {
+    struct CadView {
         painter: Option<GpuPainterHandle>,
         error: Option<String>,
         snapshot: Snapshot,
+    }
+
+    struct CadViewport {
+        views: [CadView; 2],
         animate: bool,
         last_frame: Instant,
     }
@@ -443,57 +468,69 @@ mod macos {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let now = Instant::now();
             if self.animate {
-                self.snapshot.angle += now.duration_since(self.last_frame).as_secs_f32() * 0.7;
+                let angle_change = now.duration_since(self.last_frame).as_secs_f32() * 0.7;
+                for view in &mut self.views {
+                    view.snapshot.angle += angle_change;
+                }
                 window.request_animation_frame();
             }
             self.last_frame = now;
-            let painter = self.painter.clone();
-            let snapshot = self.snapshot;
             div().size_full().flex().flex_col().gap_3().p_4().bg(rgb(0x20252c)).text_color(rgb(0xffffff))
-                .child(div().flex().gap_4()
-                    .child(div().id("mode").cursor_pointer()
-                        .child(match snapshot.mode { RenderMode::Direct => "Direct rendering", RenderMode::Offscreen => "Offscreen rendering + compositing" })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.snapshot.mode = match this.snapshot.mode { RenderMode::Direct => RenderMode::Offscreen, RenderMode::Offscreen => RenderMode::Direct };
-                            cx.notify();
-                        })))
-                    .child(div().id("animation").cursor_pointer().child(if self.animate { "Pause" } else { "Animate" })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.animate = !this.animate;
-                            this.last_frame = Instant::now();
-                            cx.notify();
-                        }))))
-                .child("Click the rendering mode to switch. Paused offscreen frames reuse the cached texture.")
-                .child(self.error.clone().or_else(|| self.painter.as_ref().and_then(|painter| painter.status().last_error)).unwrap_or_default())
-                .child(div().flex_1().overflow_hidden().bg(rgb(0x303945))
-                    .child(canvas(|_, _, _| (), move |bounds, _, window, _| {
-                        if let Some(painter) = &painter {
-                            window.paint_gpu(bounds, painter, Arc::new(snapshot)).log_err();
-                        }
-                    }).size_full()))
+                .child(div().id("animation").cursor_pointer().child(if self.animate { "Pause" } else { "Animate" })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.animate = !this.animate;
+                        this.last_frame = Instant::now();
+                        cx.notify();
+                    })))
+                .child("Click each viewport's mode to switch. Paused offscreen frames reuse the cached texture.")
+                .child(div().flex().flex_1().gap_4().children(self.views.iter().enumerate().map(|(index, view)| {
+                    let painter = view.painter.clone();
+                    let snapshot = view.snapshot;
+                    div().flex().flex_col().flex_1().gap_2().overflow_hidden()
+                        .child(div().id(("mode", index)).cursor_pointer()
+                            .child(match snapshot.mode { RenderMode::Direct => "Direct rendering", RenderMode::Offscreen => "Offscreen + shared-pass composition" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(view) = this.views.get_mut(index) {
+                                    view.snapshot.mode = match view.snapshot.mode { RenderMode::Direct => RenderMode::Offscreen, RenderMode::Offscreen => RenderMode::Direct };
+                                    cx.notify();
+                                }
+                            })))
+                        .child(view.error.clone().or_else(|| view.painter.as_ref().and_then(|painter| painter.status().last_error)).unwrap_or_default())
+                        .child(div().flex_1().overflow_hidden().bg(rgb(0x303945))
+                            .child(canvas(|_, _, _| (), move |bounds, _, window, _| {
+                                if let Some(painter) = &painter {
+                                    window.paint_gpu(bounds, painter, Arc::new(snapshot)).log_err();
+                                }
+                            }).size_full()))
+                })))
         }
     }
 
     pub fn run() {
         gpui_platform::application().run(|cx| {
-            let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
+            let bounds = Bounds::centered(None, size(px(1000.0), px(600.0)), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
                 |window, cx| {
-                    let painter = window.register_gpu_painter(metal_painter(CadPainter::default()));
-                    let error = painter.as_ref().err().map(|error| format!("{error:#}"));
-                    let painter = painter.log_err();
+                    let views = [RenderMode::Direct, RenderMode::Offscreen].map(|mode| {
+                        let painter =
+                            window.register_gpu_painter(metal_painter(CadPainter::default()));
+                        let error = painter.as_ref().err().map(|error| format!("{error:#}"));
+                        CadView {
+                            painter: painter.log_err(),
+                            error,
+                            snapshot: Snapshot {
+                                mode,
+                                angle: if mode == RenderMode::Direct { 0.0 } else { 0.9 },
+                            },
+                        }
+                    });
                     cx.new(|_| CadViewport {
-                        animate: painter.is_some(),
-                        painter,
-                        error,
-                        snapshot: Snapshot {
-                            mode: RenderMode::Direct,
-                            angle: 0.0,
-                        },
+                        views,
+                        animate: true,
                         last_frame: Instant::now(),
                     })
                 },
@@ -529,57 +566,103 @@ mod macos {
             }
         }
 
-        fn render(
-            device: &metal::DeviceRef,
-            queue: &metal::CommandQueueRef,
-            painter: &mut CadPainter,
-            snapshot: Snapshot,
-            size: u32,
-            opacity: f32,
-        ) -> Result<Vec<u8>> {
-            let color = texture(
-                device,
-                [size, size],
-                MTLPixelFormat::BGRA8Unorm,
-                1,
-                MTLTextureUsage::RenderTarget,
-            );
-            let command_buffer = queue.new_command_buffer();
-            let target = test_target(size, opacity);
-            let mut preparation = MetalPrepareContext {
-                target,
-                device,
-                command_buffer,
-                color_format: color.pixel_format(),
-            };
-            painter.prepare(&mut preparation, &snapshot)?;
-            painter.finish_prepare(&mut preparation, &snapshot)?;
-
+        fn begin_pass<'frame>(
+            command_buffer: &'frame metal::CommandBufferRef,
+            color: &'frame metal::TextureRef,
+            clear: bool,
+        ) -> Result<&'frame metal::RenderCommandEncoderRef> {
             let descriptor = metal::RenderPassDescriptor::new();
             let attachment = descriptor
                 .color_attachments()
                 .object_at(0)
                 .context("color attachment")?;
-            attachment.set_texture(Some(&color));
-            attachment.set_load_action(MTLLoadAction::Clear);
+            attachment.set_texture(Some(color));
+            attachment.set_load_action(if clear {
+                MTLLoadAction::Clear
+            } else {
+                MTLLoadAction::Load
+            });
             attachment.set_clear_color(MTLClearColor::new(0.1, 0.1, 0.1, 1.0));
             attachment.set_store_action(MTLStoreAction::Store);
-            command_buffer
-                .new_render_command_encoder(&descriptor)
-                .end_encoding();
-            painter.paint(
-                &mut MetalPaintContext {
-                    target,
-                    device,
-                    command_buffer,
-                    color_target: &color,
-                    color_format: color.pixel_format(),
-                },
-                &snapshot,
-            )?;
+            Ok(command_buffer.new_render_command_encoder(&descriptor))
+        }
 
-            let row_bytes = size as u64 * 4;
-            let byte_count = row_bytes * size as u64;
+        fn render_views(
+            device: &metal::DeviceRef,
+            queue: &metal::CommandQueueRef,
+            views: &mut [(&mut CadPainter, Snapshot, GpuPaintTarget)],
+            dimensions: [u32; 2],
+        ) -> Result<Vec<u8>> {
+            let color = texture(
+                device,
+                dimensions,
+                MTLPixelFormat::BGRA8Unorm,
+                1,
+                MTLTextureUsage::RenderTarget,
+            );
+            let command_buffer = queue.new_command_buffer();
+            for (painter, snapshot, target) in views.iter_mut() {
+                painter.prepare(
+                    &mut MetalPrepareContext {
+                        target: *target,
+                        device,
+                        command_buffer,
+                        color_format: color.pixel_format(),
+                    },
+                    snapshot,
+                )?;
+            }
+            for (painter, snapshot, target) in views.iter_mut() {
+                painter.finish_prepare(
+                    &mut MetalPrepareContext {
+                        target: *target,
+                        device,
+                        command_buffer,
+                        color_format: color.pixel_format(),
+                    },
+                    snapshot,
+                )?;
+            }
+            let mut encoder = begin_pass(command_buffer, &color, true)?;
+            for (painter, snapshot, target) in views.iter_mut() {
+                let result = match painter.draw_mode(snapshot) {
+                    GpuDrawMode::SharedPass => {
+                        encoder.set_viewport(viewport(*target));
+                        encoder.set_scissor_rect(scissor(*target));
+                        painter.draw_in_pass(
+                            &mut MetalDrawContext {
+                                target: *target,
+                                device,
+                                encoder,
+                                color_format: color.pixel_format(),
+                            },
+                            snapshot,
+                        )
+                    }
+                    GpuDrawMode::OwnPass => {
+                        encoder.end_encoding();
+                        let result = painter.paint(
+                            &mut MetalPaintContext {
+                                target: *target,
+                                device,
+                                command_buffer,
+                                color_target: &color,
+                                color_format: color.pixel_format(),
+                            },
+                            snapshot,
+                        );
+                        encoder = begin_pass(command_buffer, &color, false)?;
+                        result
+                    }
+                };
+                if let Err(error) = result {
+                    encoder.end_encoding();
+                    return Err(error);
+                }
+            }
+            encoder.end_encoding();
+            let row_bytes = dimensions[0] as u64 * 4;
+            let byte_count = row_bytes * dimensions[1] as u64;
             let buffer =
                 device.new_buffer(byte_count, metal::MTLResourceOptions::StorageModeShared);
             let blit = command_buffer.new_blit_command_encoder();
@@ -589,8 +672,8 @@ mod macos {
                 0,
                 metal::MTLOrigin { x: 0, y: 0, z: 0 },
                 metal::MTLSize {
-                    width: size as u64,
-                    height: size as u64,
+                    width: dimensions[0] as u64,
+                    height: dimensions[1] as u64,
                     depth: 1,
                 },
                 &buffer,
@@ -607,11 +690,87 @@ mod macos {
                 "GPU rendering failed: {:?}",
                 command_buffer.status()
             );
-            // The command buffer completed the copy, so these bytes are initialized and no longer being written.
+            // The completed copy initialized the whole buffer, and the GPU no longer writes to it.
             Ok(unsafe {
                 std::slice::from_raw_parts(buffer.contents().cast::<u8>(), byte_count as usize)
             }
             .to_vec())
+        }
+
+        fn render(
+            device: &metal::DeviceRef,
+            queue: &metal::CommandQueueRef,
+            painter: &mut CadPainter,
+            snapshot: Snapshot,
+            edge: u32,
+            opacity: f32,
+        ) -> Result<Vec<u8>> {
+            render_views(
+                device,
+                queue,
+                &mut [(painter, snapshot, test_target(edge, opacity))],
+                [edge, edge],
+            )
+        }
+
+        #[test]
+        fn independent_viewports_keep_their_cameras_targets_and_render_modes() -> Result<()> {
+            let device = metal::Device::system_default().context("Metal device unavailable")?;
+            let queue = device.new_command_queue();
+            let mut left = CadPainter::default();
+            let mut right = CadPainter::default();
+            let mut reference = CadPainter::default();
+            let first = Snapshot {
+                mode: RenderMode::Direct,
+                angle: 0.0,
+            };
+            let second = Snapshot {
+                mode: RenderMode::Offscreen,
+                angle: 0.9,
+            };
+            let mut left_target = test_target(64, 1.0);
+            left_target.size = [128, 64];
+            let mut right_target = left_target;
+            right_target.bounds.origin.x.0 += 64.0;
+            right_target.clip.origin.x.0 += 64.0;
+            let pixels = render_views(
+                &device,
+                &queue,
+                &mut [
+                    (&mut left, first, left_target),
+                    (&mut right, second, right_target),
+                ],
+                [128, 64],
+            )?;
+            let expected = render(&device, &queue, &mut reference, second, 64, 1.0)?;
+            let center = |pixels: &[u8], width: usize, column: usize| -> Result<[u8; 4]> {
+                pixels
+                    .get((32 * width + column) * 4..(32 * width + column) * 4 + 4)
+                    .context("center pixel")?
+                    .try_into()
+                    .map_err(anyhow::Error::from)
+            };
+            assert_eq!(center(&pixels, 128, 96)?, center(&expected, 64, 32)?);
+            assert_ne!(center(&pixels, 128, 32)?, center(&pixels, 128, 96)?);
+            let changed = render_views(
+                &device,
+                &queue,
+                &mut [
+                    (
+                        &mut left,
+                        Snapshot {
+                            mode: RenderMode::Offscreen,
+                            angle: 1.4,
+                        },
+                        left_target,
+                    ),
+                    (&mut right, second, right_target),
+                ],
+                [128, 64],
+            )?;
+            assert_eq!(center(&changed, 128, 96)?, center(&pixels, 128, 96)?);
+            assert_ne!(center(&changed, 128, 32)?, center(&pixels, 128, 32)?);
+            Ok(())
         }
 
         #[test]

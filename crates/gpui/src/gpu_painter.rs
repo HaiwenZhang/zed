@@ -16,11 +16,30 @@ use std::{
 /// drawing callbacks. Pass an adapter to [`crate::Window::register_gpu_painter`] and
 /// queue drawing with [`crate::Window::paint_gpu`].
 pub trait GpuPainter: Any + Send {
+    /// Selects drawing access for a successfully prepared surface.
+    ///
+    /// Called after this surface finishes preparation, before scene drawing. Do
+    /// not encode commands or reenter GPUI here. Backend adapters delegate this
+    /// choice to their native painter; existing painters use independent passes.
+    fn draw_mode(&self, _data: &(dyn Any + Send + Sync)) -> GpuDrawMode {
+        GpuDrawMode::OwnPass
+    }
+
     /// Releases resources before the window's device or renderer is retired.
     ///
     /// Resize alone does not call this method. After [`GpuResetReason::DeviceReplaced`],
     /// recreate resources on the device supplied to the next preparation or drawing callback.
     fn reset(&mut self, reason: GpuResetReason);
+}
+
+/// The drawing access requested by an application GPU painter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GpuDrawMode {
+    /// Draw into GPUI's current pass without replacing its attachments.
+    SharedPass,
+    /// End GPUI's pass and let the painter encode independent passes.
+    #[default]
+    OwnPass,
 }
 
 /// Why a renderer must release its resources.
@@ -49,10 +68,29 @@ pub struct GpuPaintTarget {
     pub opacity: f32,
 }
 
+impl GpuPaintTarget {
+    /// Returns an integer scissor `[left, top, width, height] inside the clip and target.
+    ///
+    /// Fractional edges round inward so writes cannot escape the inherited clip.
+    /// A subpixel clip may produce a zero width or height.
+    pub fn scissor_rect(&self) -> [u32; 4] {
+        let left = self.clip.origin.x.0.ceil().clamp(0.0, self.size[0] as f32) as u32;
+        let top = self.clip.origin.y.0.ceil().clamp(0.0, self.size[1] as f32) as u32;
+        let right = self.clip.right().0.floor().clamp(0.0, self.size[0] as f32) as u32;
+        let bottom = self.clip.bottom().0.floor().clamp(0.0, self.size[1] as f32) as u32;
+        [
+            left,
+            top,
+            right.saturating_sub(left),
+            bottom.saturating_sub(top),
+        ]
+    }
+}
+
 /// Encoding diagnostics; these do not establish GPU execution completion.
 #[derive(Clone, Debug, Default)]
 pub struct GpuPainterStatus {
-    /// Successful callback encodings.
+    /// Successful drawing callback encodings.
     pub encoded: u64,
     /// Lifecycle notifications.
     pub resets: u64,
@@ -149,13 +187,18 @@ pub enum GpuPreparationPhase {
 /// Per-surface preparation results for one frame encoding attempt.
 #[doc(hidden)]
 pub struct GpuPaintPreparation {
-    ready: Vec<bool>,
+    modes: Vec<Option<GpuDrawMode>>,
 }
 
 impl GpuPaintPreparation {
     /// Whether this surface is visible and both preparation stages succeeded.
     pub fn is_ready(&self, surface_index: usize) -> bool {
-        self.ready.get(surface_index).copied().unwrap_or(false)
+        self.draw_mode(surface_index).is_some()
+    }
+
+    /// The selected drawing mode, or `None` if this surface must be skipped.
+    pub fn draw_mode(&self, surface_index: usize) -> Option<GpuDrawMode> {
+        self.modes.get(surface_index).copied().flatten()
     }
 }
 
@@ -188,18 +231,30 @@ pub fn prepare_gpu_paints<T: GpuPainter>(
         .iter()
         .map(|target| target.clip.size.width.0 > 0.0 && target.clip.size.height.0 > 0.0)
         .collect();
+    let mut modes = vec![None; surfaces.len()];
 
     for phase in [
         GpuPreparationPhase::Prepare,
         GpuPreparationPhase::FinishPrepare,
     ] {
-        for ((surface, target), ready) in surfaces.iter().zip(&targets).zip(&mut ready) {
+        for (((surface, target), ready), mode) in surfaces
+            .iter()
+            .zip(&targets)
+            .zip(&mut ready)
+            .zip(&mut modes)
+        {
             if *ready {
                 *ready = surface
                     .draw
                     .handle
                     .invoke_callback::<T>(
-                        |painter| callback(painter, &surface.draw, *target, phase),
+                        |painter| {
+                            callback(painter, &surface.draw, *target, phase)?;
+                            if phase == GpuPreparationPhase::FinishPrepare {
+                                *mode = Some(painter.draw_mode(surface.draw.data.as_ref()));
+                            }
+                            Ok(())
+                        },
                         false,
                     )
                     .log_err()
@@ -208,7 +263,7 @@ pub fn prepare_gpu_paints<T: GpuPainter>(
         }
     }
 
-    GpuPaintPreparation { ready }
+    GpuPaintPreparation { modes }
 }
 
 /// A weak painter registration used by platform renderers.
@@ -314,9 +369,9 @@ impl GpuPaintPrimitive {
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuPaintPrimitive, GpuPainter, GpuPainterHandle, GpuPainterRegistration,
-        GpuPainterRegistry, GpuPainterStatus, GpuPreparationPhase, GpuResetReason, PainterState,
-        prepare_gpu_paints,
+        GpuDrawMode, GpuPaintPrimitive, GpuPaintTarget, GpuPainter, GpuPainterHandle,
+        GpuPainterRegistration, GpuPainterRegistry, GpuPainterStatus, GpuPreparationPhase,
+        GpuResetReason, PainterState, prepare_gpu_paints,
     };
     use crate::{
         Bounds, ContentMask, Context, GpuPaintSurface, IntoElement, PrimitiveBatch, Quad, Render,
@@ -360,6 +415,100 @@ mod tests {
                 opacity: 0.5,
             },
         }
+    }
+
+    #[test]
+    fn draw_modes_are_selected_after_preparation_for_each_encoding_attempt() {
+        struct SelectingPainter {
+            mode: GpuDrawMode,
+            selections: Arc<Mutex<Vec<GpuDrawMode>>>,
+        }
+        impl GpuPainter for SelectingPainter {
+            fn draw_mode(&self, _: &(dyn std::any::Any + Send + Sync)) -> GpuDrawMode {
+                self.selections.lock().push(self.mode);
+                self.mode
+            }
+            fn reset(&mut self, _: GpuResetReason) {}
+        }
+
+        let selections = Arc::new(Mutex::new(Vec::new()));
+        let owner = WindowHandle::<TestView>::new(WindowId::default()).into();
+        let (handle, _) = GpuPainterHandle::new(
+            owner,
+            SelectingPainter {
+                mode: GpuDrawMode::OwnPass,
+                selections: selections.clone(),
+            },
+        );
+        let mut surfaces = [
+            recording_surface(1),
+            recording_surface(2),
+            recording_surface(3),
+        ];
+        for surface in &mut surfaces {
+            surface.draw.handle = handle.clone();
+        }
+
+        for reverse in [false, true] {
+            let preparation = prepare_gpu_paints::<SelectingPainter>(
+                &surfaces,
+                [100, 100],
+                1,
+                |painter, draw, _, phase| {
+                    let snapshot = draw.data.downcast_ref::<u32>().copied().unwrap_or_default();
+                    if snapshot == 3 {
+                        anyhow::bail!("surface failed before mode selection");
+                    }
+                    if phase == GpuPreparationPhase::FinishPrepare {
+                        painter.mode = if (snapshot == 1) != reverse {
+                            GpuDrawMode::SharedPass
+                        } else {
+                            GpuDrawMode::OwnPass
+                        };
+                    }
+                    Ok(())
+                },
+            );
+            let expected = if reverse {
+                [GpuDrawMode::OwnPass, GpuDrawMode::SharedPass]
+            } else {
+                [GpuDrawMode::SharedPass, GpuDrawMode::OwnPass]
+            };
+            assert_eq!(preparation.draw_mode(0), Some(expected[0]));
+            assert_eq!(preparation.draw_mode(1), Some(expected[1]));
+            assert_eq!(preparation.draw_mode(2), None);
+        }
+        assert_eq!(
+            *selections.lock(),
+            [
+                GpuDrawMode::SharedPass,
+                GpuDrawMode::OwnPass,
+                GpuDrawMode::OwnPass,
+                GpuDrawMode::SharedPass
+            ]
+        );
+        assert_eq!(handle.status().encoded, 0);
+    }
+
+    #[test]
+    fn scissor_rounds_inward_and_clamps_to_the_target() {
+        let mut target = GpuPaintTarget {
+            size: [100, 80],
+            bounds: Bounds::default(),
+            clip: Bounds::new(
+                point(ScaledPixels(-5.5), ScaledPixels(4.5)),
+                size(ScaledPixels(110.0), ScaledPixels(100.0)),
+            ),
+            scale_factor: 2.0,
+            sample_count: 1,
+            opacity: 1.0,
+        };
+        assert_eq!(target.scissor_rect(), [0, 5, 100, 75]);
+        target.clip = Bounds::new(
+            point(ScaledPixels(10.2), ScaledPixels(12.2)),
+            size(ScaledPixels(0.5), ScaledPixels(0.5)),
+        );
+        assert_eq!(target.scissor_rect(), [11, 13, 0, 0]);
     }
 
     #[test]

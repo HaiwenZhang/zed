@@ -1,12 +1,15 @@
-use crate::gpu_painter::{WgpuPaintContext, WgpuPainterAdapter, WgpuPrepareContext};
+use crate::gpu_painter::{
+    WgpuDrawContext, WgpuPaintContext, WgpuPainter, WgpuPainterAdapter, WgpuPrepareContext,
+};
 use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuPainterRegistration, GpuPainterRegistry,
-    GpuPreparationPhase, GpuResetReason, GpuSpecs, Path, Point, PrimitiveBatch, ScaledPixels,
-    Scene, SceneBatch, Size, get_gamma_correction_ratios, prepare_gpu_paints,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuDrawMode, GpuPaintTarget,
+    GpuPainterRegistration, GpuPainterRegistry, GpuPreparationPhase, GpuResetReason, GpuSpecs,
+    Path, Point, PrimitiveBatch, ScaledPixels, Scene, SceneBatch, Size,
+    get_gamma_correction_ratios, prepare_gpu_paints,
 };
 use gpui_util::ResultExt;
 use log::warn;
@@ -1555,52 +1558,84 @@ impl WgpuRendererCore {
                 let batch = match batch {
                     SceneBatch::Primitive(batch) => batch,
                     SceneBatch::GpuPaints(range) => {
-                        drop(pass);
-                        for (offset, surface) in scene.gpu_paints[range.clone()].iter().enumerate()
-                        {
-                            if !preparation.is_ready(range.start + offset) {
-                                continue;
-                            }
+                        let mut surfaces = scene.gpu_paints[range.clone()]
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(offset, surface)| {
+                                let mode = preparation.draw_mode(range.start + offset)?;
+                                let target = surface.draw.target(
+                                    [size.width.0 as u32, size.height.0 as u32],
+                                    surface.bounds,
+                                    surface.content_mask,
+                                    1,
+                                );
+                                let [_, _, width, height] = target.scissor_rect();
+                                (width > 0 && height > 0).then_some((surface, mode, target))
+                            })
+                            .peekable();
+                        while let Some((surface, mode, target)) = surfaces.next() {
                             let draw = &surface.draw;
-
-                            let target = draw.target(
-                                [size.width.0 as u32, size.height.0 as u32],
-                                surface.bounds,
-                                surface.content_mask,
-                                1,
-                            );
-                            if target.clip.size.width.0 > 0.0 && target.clip.size.height.0 > 0.0 {
-                                draw.handle
-                                    .invoke::<WgpuPainterAdapter>(|painter| {
-                                        painter.0.paint(
-                                            &mut WgpuPaintContext {
+                            match mode {
+                                GpuDrawMode::SharedPass => {
+                                    draw.handle
+                                        .invoke::<WgpuPainterAdapter>(|painter| {
+                                            self.draw_gpu_in_pass(
+                                                painter.0.as_mut(),
                                                 target,
-                                                device: &self.resources().device,
-                                                encoder: &mut encoder,
-                                                color_target: frame_view,
-                                                color_format: self.target_format,
+                                                draw.data.as_ref(),
+                                                &mut pass,
+                                            )
+                                        })
+                                        .log_err();
+                                }
+                                GpuDrawMode::OwnPass => {
+                                    drop(pass);
+                                    let mut paint = |surface: &gpui::GpuPaintSurface, target| {
+                                        let draw = &surface.draw;
+                                        draw.handle
+                                            .invoke::<WgpuPainterAdapter>(|painter| {
+                                                painter.0.paint(
+                                                    &mut WgpuPaintContext {
+                                                        target,
+                                                        device: &self.resources().device,
+                                                        encoder: &mut encoder,
+                                                        color_target: frame_view,
+                                                        color_format: self.target_format,
+                                                    },
+                                                    draw.data.as_ref(),
+                                                )
+                                            })
+                                            .log_err();
+                                    };
+                                    paint(surface, target);
+                                    // Adjacent independent painters do not need an empty UI pass between them.
+                                    while surfaces
+                                        .peek()
+                                        .is_some_and(|(_, mode, _)| *mode == GpuDrawMode::OwnPass)
+                                    {
+                                        if let Some((surface, _, target)) = surfaces.next() {
+                                            paint(surface, target);
+                                        }
+                                    }
+                                    pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        label: Some("main_pass_after_gpu_painter"),
+                                        color_attachments: &[Some(
+                                            wgpu::RenderPassColorAttachment {
+                                                view: frame_view,
+                                                resolve_target: None,
+                                                depth_slice: None,
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Load,
+                                                    store: wgpu::StoreOp::Store,
+                                                },
                                             },
-                                            draw.data.as_ref(),
-                                        )
-                                    })
-                                    .log_err();
+                                        )],
+                                        depth_stencil_attachment: None,
+                                        ..Default::default()
+                                    });
+                                }
                             }
                         }
-                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("main_pass_after_gpu_painter"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: frame_view,
-                                resolve_target: None,
-                                depth_slice: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Load,
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: None,
-                            ..Default::default()
-                        });
-
                         continue;
                     }
                 };
@@ -1703,6 +1738,64 @@ impl WgpuRendererCore {
             .queue
             .submit(std::iter::once(encoder.finish()));
         Ok(submission)
+    }
+
+    fn draw_gpu_in_pass(
+        &self,
+        painter: &mut dyn WgpuPainter,
+        target: GpuPaintTarget,
+        data: &(dyn std::any::Any + Send + Sync),
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> Result<()> {
+        let bounds = target.bounds;
+        let maximum_size = self.resources().device.limits().max_texture_dimension_2d as f32;
+        let maximum_position = maximum_size * 2.0;
+        anyhow::ensure!(
+            bounds.origin.x.0.is_finite()
+                && bounds.origin.y.0.is_finite()
+                && bounds.size.width.0.is_finite()
+                && bounds.size.height.0.is_finite()
+                && bounds.size.width.0 > 0.0
+                && bounds.size.height.0 > 0.0
+                && bounds.size.width.0 <= maximum_size
+                && bounds.size.height.0 <= maximum_size
+                && bounds.origin.x.0 >= -maximum_position
+                && bounds.origin.y.0 >= -maximum_position
+                && bounds.right().0 <= maximum_position - 1.0
+                && bounds.bottom().0 <= maximum_position - 1.0,
+            "GPU painter viewport exceeds the device's supported range: {bounds:?}"
+        );
+        let [left, top, width, height] = target.scissor_rect();
+        pass.set_viewport(
+            target.bounds.origin.x.0,
+            target.bounds.origin.y.0,
+            target.bounds.size.width.0,
+            target.bounds.size.height.0,
+            0.0,
+            1.0,
+        );
+        pass.set_scissor_rect(left, top, width, height);
+        let result = painter.draw_in_pass(
+            &mut WgpuDrawContext {
+                target,
+                device: &self.resources().device,
+                pass,
+                color_format: self.target_format,
+            },
+            data,
+        );
+        pass.set_viewport(
+            0.0,
+            0.0,
+            target.size[0] as f32,
+            target.size[1] as f32,
+            0.0,
+            1.0,
+        );
+        pass.set_scissor_rect(0, 0, target.size[0], target.size[1]);
+        pass.set_blend_constant(wgpu::Color::TRANSPARENT);
+        pass.set_stencil_reference(0);
+        result
     }
 
     fn write_instances(
@@ -2416,6 +2509,10 @@ pub struct WgpuHeadlessRenderer {
 impl WgpuHeadlessRenderer {
     pub fn new() -> anyhow::Result<Self> {
         let (context, target_format) = WgpuContext::new_headless()?;
+        Ok(Self::from_context(context, target_format))
+    }
+
+    fn from_context(context: WgpuContext, target_format: wgpu::TextureFormat) -> Self {
         // The device may be shared with earlier renderers; observe only errors raised from
         // here on, including any while this renderer builds its pipelines.
         let observed_error_generation = context.errors().current_generation();
@@ -2427,12 +2524,12 @@ impl WgpuHeadlessRenderer {
             wgpu::CompositeAlphaMode::Opaque,
         );
 
-        Ok(Self {
+        Self {
             context,
             core,
             render_target: None,
             observed_error_generation,
-        })
+        }
     }
 
     fn ensure_render_target(&mut self, size: Size<DevicePixels>) -> anyhow::Result<()> {
@@ -2716,6 +2813,184 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use gpui::{DevicePixels, PlatformHeadlessRenderer, Scene};
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn shared_pass_restores_ui_state_after_an_encoding_error() -> Result<()> {
+        struct SharedPainter(wgpu::RenderPipeline);
+        impl WgpuPainter for SharedPainter {
+            fn draw_mode(&self, _: &(dyn std::any::Any + Send + Sync)) -> GpuDrawMode {
+                GpuDrawMode::SharedPass
+            }
+            fn draw_in_pass(
+                &mut self,
+                context: &mut WgpuDrawContext<'_, '_>,
+                _: &(dyn std::any::Any + Send + Sync),
+            ) -> Result<()> {
+                context.pass.set_pipeline(&self.0);
+                context.pass.draw(0..6, 0..1);
+                context.pass.set_viewport(0.0, 0.0, 1.0, 1.0, 0.0, 1.0);
+                context.pass.set_scissor_rect(0, 0, 1, 1);
+                context.pass.set_blend_constant(wgpu::Color::WHITE);
+                context.pass.set_stencil_reference(123);
+                anyhow::bail!("shared drawing failed after encoding");
+            }
+            fn reset(&mut self, _: GpuResetReason) {}
+        }
+
+        let (context, format) = WgpuContext::new_headless_for_test(if cfg!(target_os = "macos") {
+            wgpu::Backends::METAL
+        } else {
+            wgpu::Backends::VULKAN | wgpu::Backends::GL
+        })?;
+        let mut renderer = WgpuHeadlessRenderer::from_context(context, format);
+        let viewport_size = gpui::size(DevicePixels(64), DevicePixels(64));
+        renderer.render(&Scene::default(), viewport_size)?;
+        let device = &renderer.context.device;
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shared_pass_test"),
+            source: wgpu::ShaderSource::Wgsl(r#"
+                @vertex fn vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+                    let positions = array<vec2<f32>, 6>(
+                        vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(-1.0, 1.0),
+                        vec2(-1.0, 1.0), vec2(1.0, -1.0), vec2(1.0, 1.0)
+                    );
+                    return vec4(positions[index], 0.0, 1.0);
+                }
+                @fragment fn fragment() -> @location(0) vec4<f32> {
+                    return vec4(0.0, 0.0, 1.0, 1.0);
+                }
+            "#.into()),
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shared_pass_test"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vertex"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fragment"),
+                targets: &[Some(renderer.core.target_format.into())],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let mut painter = SharedPainter(pipeline);
+        let bounds = |left, top, width, height| {
+            Bounds::new(
+                gpui::point(ScaledPixels(left), ScaledPixels(top)),
+                gpui::size(ScaledPixels(width), ScaledPixels(height)),
+            )
+        };
+        let mut scene = Scene::default();
+        for (bounds, color) in [
+            (bounds(2.0, 2.0, 6.0, 6.0), 0xff00ff),
+            (bounds(50.0, 50.0, 8.0, 8.0), 0xffff00),
+        ] {
+            scene.insert_primitive(Quad {
+                bounds,
+                content_mask: ContentMask { bounds },
+                background: gpui::rgb(color).into(),
+                ..Default::default()
+            });
+        }
+        scene.finish();
+        let mut offset = 0;
+        let bindings = renderer.core.write_instances(&scene, &mut offset)?;
+        let view = renderer
+            .render_target
+            .as_ref()
+            .context("target")?
+            .view
+            .clone();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shared_pass_test"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            let resources = renderer.core.resources();
+            let invalid = renderer.core.draw_gpu_in_pass(
+                &mut painter,
+                GpuPaintTarget {
+                    size: [64, 64],
+                    bounds: bounds(
+                        0.0,
+                        0.0,
+                        device.limits().max_texture_dimension_2d as f32 + 1.0,
+                        16.0,
+                    ),
+                    clip: bounds(0.0, 0.0, 16.0, 16.0),
+                    scale_factor: 1.0,
+                    sample_count: 1,
+                    opacity: 1.0,
+                },
+                &(),
+                &mut pass,
+            );
+            assert!(invalid.is_err_and(|error| error.to_string().contains("supported range")));
+            renderer.core.draw_instances(
+                &bindings.quads,
+                &resources.pipelines.quads,
+                0..1,
+                &mut pass,
+            );
+            let result = renderer.core.draw_gpu_in_pass(
+                &mut painter,
+                GpuPaintTarget {
+                    size: [64, 64],
+                    bounds: bounds(16.0, 16.0, 32.0, 32.0),
+                    clip: bounds(20.0, 20.0, 16.0, 16.0),
+                    scale_factor: 2.0,
+                    sample_count: 1,
+                    opacity: 1.0,
+                },
+                &(),
+                &mut pass,
+            );
+            assert!(result.is_err());
+            renderer.core.draw_instances(
+                &bindings.quads,
+                &resources.pipelines.quads,
+                1..2,
+                &mut pass,
+            );
+        }
+        renderer.context.queue.submit([encoder.finish()]);
+        let image = renderer.read_image()?;
+        for (position, expected) in [
+            ((4, 4), [255, 0, 255, 255]),
+            ((28, 28), [0, 0, 255, 255]),
+            ((18, 28), [0, 0, 0, 255]),
+            ((54, 54), [255, 255, 0, 255]),
+        ] {
+            assert_eq!(
+                image
+                    .get_pixel_checked(position.0, position.1)
+                    .context("pixel")?
+                    .0,
+                expected
+            );
+        }
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     fn device_size(width: i32, height: i32) -> Size<DevicePixels> {
