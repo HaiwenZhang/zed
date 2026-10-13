@@ -5017,9 +5017,13 @@ impl Window {
 
     /// Registers an application painter on this window's GPU backend.
     ///
-    /// Returns an error if the backend cannot provide direct GPU drawing.
+    /// Returns an error if the window cannot provide GPU drawing or the painter
+    /// does not support its backend.
     /// The returned handle can only be used with this window.
-    pub fn register_gpu_painter(&mut self, painter: impl GpuPainter) -> Result<GpuPainterHandle> {
+    pub fn register_gpu_painter<P: GpuPainter>(
+        &mut self,
+        painter: P,
+    ) -> Result<GpuPainterHandle<P::Snapshot>> {
         let (handle, registration) = GpuPainterHandle::new(self.handle, painter);
         self.platform_window.register_gpu_painter(registration)?;
         Ok(handle)
@@ -5036,11 +5040,11 @@ impl Window {
     /// directly into the frame or composite an application-owned offscreen target.
     ///
     /// Returns an error if `handle` was registered with another window.
-    pub fn paint_gpu(
+    pub fn paint_gpu<Snapshot: Send + Sync + 'static>(
         &mut self,
         bounds: Bounds<Pixels>,
-        handle: &GpuPainterHandle,
-        data: Arc<dyn Any + Send + Sync>,
+        handle: &GpuPainterHandle<Snapshot>,
+        data: Arc<Snapshot>,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
         anyhow::ensure!(
@@ -5054,7 +5058,7 @@ impl Window {
             bounds: self.snap_bounds(bounds),
             content_mask: self.snapped_content_mask(),
             draw: GpuPaintPrimitive {
-                handle: handle.clone(),
+                handle: handle.erase(),
                 data,
                 scale_factor,
                 opacity,

@@ -1,4 +1,3 @@
-use crate::gpu_painter::{D3D11PaintContext, D3D11PainterAdapter, D3D11PrepareContext};
 use std::{
     slice,
     sync::{Arc, OnceLock},
@@ -364,28 +363,29 @@ impl DirectXRenderer {
         })?;
         self.upload_scene_buffers(scene)?;
 
-        let preparation = prepare_gpu_paints::<D3D11PainterAdapter>(
+        let preparation = prepare_gpu_paints(
             &scene.gpu_paints,
             [self.width, self.height],
             1,
+            GpuBackend::D3D11.capabilities(),
             |painter, draw, target, phase| {
                 let _restore = self.enter_gpu_painter()?;
                 let devices = self.devices.as_ref().context("devices missing")?;
                 unsafe {
                     devices.device_context.OMSetRenderTargets(None, None);
                 }
-                let mut context = D3D11PrepareContext {
+                let mut context = GpuPrepareContext::D3D11(D3D11PrepareContext {
                     target,
                     device: &devices.device,
                     context: &devices.device_context,
                     color_format: RENDER_TARGET_FORMAT,
-                };
+                });
                 match phase {
                     GpuPreparationPhase::Prepare => {
-                        painter.0.prepare(&mut context, draw.data.as_ref())
+                        painter.prepare_erased(&mut context, draw.data.as_ref())
                     }
                     GpuPreparationPhase::FinishPrepare => {
-                        painter.0.finish_prepare(&mut context, draw.data.as_ref())
+                        painter.finish_prepare_erased(&mut context, draw.data.as_ref())
                     }
                 }
             },
@@ -858,10 +858,7 @@ impl DirectXRenderer {
         &mut self,
         registration: GpuPainterRegistration,
     ) -> Result<()> {
-        anyhow::ensure!(
-            registration.is::<D3D11PainterAdapter>(),
-            "GPU painter is incompatible with this backend"
-        );
+        registration.validate(GpuBackend::D3D11)?;
         self.ensure_gpu_painter_state()?;
         self.gpu_painters.register(registration);
         Ok(())
@@ -949,15 +946,15 @@ impl DirectXRenderer {
                     .RSSetViewports(Some(&[resources.viewport]));
             }
             draw.handle
-                .invoke::<D3D11PainterAdapter>(|painter| {
-                    painter.0.paint(
-                        &mut D3D11PaintContext {
+                .invoke(|painter| {
+                    painter.paint_erased(
+                        &mut GpuPaintContext::D3D11(D3D11PaintContext {
                             target,
                             device: &devices.device,
                             context: &devices.device_context,
                             color_target,
                             color_format: RENDER_TARGET_FORMAT,
-                        },
+                        }),
                         draw.data.as_ref(),
                     )
                 })

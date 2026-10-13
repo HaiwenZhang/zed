@@ -6,11 +6,7 @@
 //! windowing, and input to each platform backend.
 
 mod dispatcher;
-mod gpu_painter;
 mod metal_atlas;
 pub mod metal_renderer;
 
 pub use dispatcher::{AppleActivity, AppleDispatcher};
-pub use gpu_painter::{
-    MetalDrawContext, MetalPaintContext, MetalPainter, MetalPrepareContext, metal_painter,
-};

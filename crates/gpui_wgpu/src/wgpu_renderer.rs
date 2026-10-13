@@ -1,14 +1,12 @@
-use crate::gpu_painter::{
-    WgpuDrawContext, WgpuPaintContext, WgpuPainter, WgpuPainterAdapter, WgpuPrepareContext,
-};
 use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuDrawMode, GpuPaintTarget,
-    GpuPainterRegistration, GpuPainterRegistry, GpuPreparationPhase, GpuResetReason, GpuSpecs,
-    Path, Point, PrimitiveBatch, ScaledPixels, Scene, SceneBatch, Size,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuBackend, GpuDrawMode, GpuPaintContext,
+    GpuPaintTarget, GpuPainterRegistration, GpuPainterRegistry, GpuPassContext,
+    GpuPreparationPhase, GpuPrepareContext, GpuResetReason, GpuSpecs, Path, Point, PrimitiveBatch,
+    ScaledPixels, Scene, SceneBatch, Size, WgpuDrawContext, WgpuPaintContext, WgpuPrepareContext,
     get_gamma_correction_ratios, prepare_gpu_paints,
 };
 use gpui_util::ResultExt;
@@ -1515,24 +1513,25 @@ impl WgpuRendererCore {
                     label: Some("main_encoder"),
                 });
 
-        let preparation = prepare_gpu_paints::<WgpuPainterAdapter>(
+        let preparation = prepare_gpu_paints(
             &scene.gpu_paints,
             [size.width.0 as u32, size.height.0 as u32],
             1,
+            GpuBackend::Wgpu.capabilities(),
             |painter, draw, target, phase| {
-                let mut context = WgpuPrepareContext {
+                let mut context = GpuPrepareContext::Wgpu(WgpuPrepareContext {
                     target,
                     device: &self.resources().device,
                     queue: &self.resources().queue,
                     encoder: &mut encoder,
                     color_format: self.target_format,
-                };
+                });
                 match phase {
                     GpuPreparationPhase::Prepare => {
-                        painter.0.prepare(&mut context, draw.data.as_ref())
+                        painter.prepare_erased(&mut context, draw.data.as_ref())
                     }
                     GpuPreparationPhase::FinishPrepare => {
-                        painter.0.finish_prepare(&mut context, draw.data.as_ref())
+                        painter.finish_prepare_erased(&mut context, draw.data.as_ref())
                     }
                 }
             },
@@ -1578,9 +1577,9 @@ impl WgpuRendererCore {
                             match mode {
                                 GpuDrawMode::SharedPass => {
                                     draw.handle
-                                        .invoke::<WgpuPainterAdapter>(|painter| {
+                                        .invoke(|painter| {
                                             self.draw_gpu_in_pass(
-                                                painter.0.as_mut(),
+                                                painter,
                                                 target,
                                                 draw.data.as_ref(),
                                                 &mut pass,
@@ -1593,15 +1592,15 @@ impl WgpuRendererCore {
                                     let mut paint = |surface: &gpui::GpuPaintSurface, target| {
                                         let draw = &surface.draw;
                                         draw.handle
-                                            .invoke::<WgpuPainterAdapter>(|painter| {
-                                                painter.0.paint(
-                                                    &mut WgpuPaintContext {
+                                            .invoke(|painter| {
+                                                painter.paint_erased(
+                                                    &mut GpuPaintContext::Wgpu(WgpuPaintContext {
                                                         target,
                                                         device: &self.resources().device,
                                                         encoder: &mut encoder,
                                                         color_target: frame_view,
                                                         color_format: self.target_format,
-                                                    },
+                                                    }),
                                                     draw.data.as_ref(),
                                                 )
                                             })
@@ -1742,7 +1741,7 @@ impl WgpuRendererCore {
 
     fn draw_gpu_in_pass(
         &self,
-        painter: &mut dyn WgpuPainter,
+        painter: &mut dyn gpui::ErasedGpuPainter,
         target: GpuPaintTarget,
         data: &(dyn std::any::Any + Send + Sync),
         pass: &mut wgpu::RenderPass<'_>,
@@ -1775,13 +1774,13 @@ impl WgpuRendererCore {
             1.0,
         );
         pass.set_scissor_rect(left, top, width, height);
-        let result = painter.draw_in_pass(
-            &mut WgpuDrawContext {
+        let result = painter.draw_in_pass_erased(
+            &mut GpuPassContext::Wgpu(WgpuDrawContext {
                 target,
                 device: &self.resources().device,
                 pass,
                 color_format: self.target_format,
-            },
+            }),
             data,
         );
         pass.set_viewport(
@@ -2359,10 +2358,7 @@ impl WgpuRenderer {
     }
 
     pub fn register_gpu_painter(&self, registration: GpuPainterRegistration) -> Result<()> {
-        anyhow::ensure!(
-            registration.is::<WgpuPainterAdapter>(),
-            "GPU painter is incompatible with this backend"
-        );
+        registration.validate(GpuBackend::Wgpu)?;
         self.gpu_painters.register(registration);
         Ok(())
     }
@@ -2818,15 +2814,16 @@ mod tests {
     #[test]
     fn shared_pass_restores_ui_state_after_an_encoding_error() -> Result<()> {
         struct SharedPainter(wgpu::RenderPipeline);
-        impl WgpuPainter for SharedPainter {
-            fn draw_mode(&self, _: &(dyn std::any::Any + Send + Sync)) -> GpuDrawMode {
+        impl gpui::GpuPainter for SharedPainter {
+            type Snapshot = ();
+            fn supports_backend(&self, backend: GpuBackend) -> bool {
+                backend == GpuBackend::Wgpu
+            }
+            fn draw_mode(&self, _: gpui::GpuCapabilities, _: &()) -> GpuDrawMode {
                 GpuDrawMode::SharedPass
             }
-            fn draw_in_pass(
-                &mut self,
-                context: &mut WgpuDrawContext<'_, '_>,
-                _: &(dyn std::any::Any + Send + Sync),
-            ) -> Result<()> {
+            fn draw_in_pass(&mut self, context: &mut GpuPassContext<'_, '_>, _: &()) -> Result<()> {
+                let context = context.wgpu()?;
                 context.pass.set_pipeline(&self.0);
                 context.pass.draw(0..6, 0..1);
                 context.pass.set_viewport(0.0, 0.0, 1.0, 1.0, 0.0, 1.0);

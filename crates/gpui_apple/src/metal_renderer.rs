@@ -1,15 +1,13 @@
-use crate::gpu_painter::{
-    MetalDrawContext, MetalPaintContext, MetalPainter, MetalPainterAdapter, MetalPrepareContext,
-};
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, GpuDrawMode,
-    GpuPainterRegistration, GpuPainterRegistry, GpuPreparationPhase, GpuResetReason, PaintSurface,
-    Path, Point, PrimitiveBatch, ScaledPixels, Scene, SceneBatch, Size, point, prepare_gpu_paints,
-    size,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, GpuBackend, GpuDrawMode,
+    GpuPaintContext, GpuPainterRegistration, GpuPainterRegistry, GpuPassContext,
+    GpuPreparationPhase, GpuPrepareContext, GpuResetReason, MetalDrawContext, MetalPaintContext,
+    MetalPrepareContext, PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels, Scene,
+    SceneBatch, Size, point, prepare_gpu_paints, size,
 };
 use gpui_util::ResultExt;
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -481,10 +479,7 @@ impl MetalRenderer {
     }
 
     pub fn register_gpu_painter(&self, registration: GpuPainterRegistration) -> Result<()> {
-        anyhow::ensure!(
-            registration.is::<MetalPainterAdapter>(),
-            "GPU painter is incompatible with this backend"
-        );
+        registration.validate(GpuBackend::Metal)?;
         self.gpu_painters.register(registration);
         Ok(())
     }
@@ -725,23 +720,24 @@ impl MetalRenderer {
         let device = self.device.clone();
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
-        let preparation = prepare_gpu_paints::<MetalPainterAdapter>(
+        let preparation = prepare_gpu_paints(
             &scene.gpu_paints,
             [texture.width() as u32, texture.height() as u32],
             texture.sample_count() as u32,
+            GpuBackend::Metal.capabilities(),
             |painter, draw, target, phase| {
-                let mut context = MetalPrepareContext {
+                let mut context = GpuPrepareContext::Metal(MetalPrepareContext {
                     target,
                     device: &self.device,
                     command_buffer,
                     color_format: texture.pixel_format(),
-                };
+                });
                 match phase {
                     GpuPreparationPhase::Prepare => {
-                        painter.0.prepare(&mut context, draw.data.as_ref())
+                        painter.prepare_erased(&mut context, draw.data.as_ref())
                     }
                     GpuPreparationPhase::FinishPrepare => {
-                        painter.0.finish_prepare(&mut context, draw.data.as_ref())
+                        painter.finish_prepare_erased(&mut context, draw.data.as_ref())
                     }
                 }
             },
@@ -774,9 +770,9 @@ impl MetalRenderer {
                         let [_, _, width, height] = target.scissor_rect();
                         if width > 0 && height > 0 {
                             draw.handle
-                                .invoke::<MetalPainterAdapter>(|painter| {
+                                .invoke(|painter| {
                                     self.draw_gpu_surface(
-                                        painter.0.as_mut(),
+                                        painter,
                                         mode,
                                         MetalPaintContext {
                                             target,
@@ -870,9 +866,9 @@ impl MetalRenderer {
 
     fn draw_gpu_surface<'frame>(
         &self,
-        painter: &mut dyn MetalPainter,
+        painter: &mut dyn gpui::ErasedGpuPainter,
         mode: GpuDrawMode,
-        mut context: MetalPaintContext<'frame>,
+        context: MetalPaintContext<'frame>,
         data: &(dyn std::any::Any + Send + Sync),
         command_encoder: &mut &'frame metal::RenderCommandEncoderRef,
         viewport_size: Size<DevicePixels>,
@@ -895,13 +891,13 @@ impl MetalRenderer {
                     width: width as u64,
                     height: height as u64,
                 });
-                let result = painter.draw_in_pass(
-                    &mut MetalDrawContext {
+                let result = painter.draw_in_pass_erased(
+                    &mut GpuPassContext::Metal(&mut MetalDrawContext {
                         target,
                         device: context.device,
                         encoder: command_encoder,
                         color_format: context.color_format,
-                    },
+                    }),
                     data,
                 );
                 self.restore_ui_encoder_state(command_encoder, target.size, viewport_size);
@@ -909,10 +905,12 @@ impl MetalRenderer {
             }
             GpuDrawMode::OwnPass => {
                 command_encoder.end_encoding();
-                let result = painter.paint(&mut context, data);
+                let command_buffer = context.command_buffer;
+                let color_target = context.color_target;
+                let result = painter.paint_erased(&mut GpuPaintContext::Metal(context), data);
                 *command_encoder = new_command_encoder_for_texture(
-                    context.command_buffer,
-                    context.color_target,
+                    command_buffer,
+                    color_target,
                     viewport_size,
                     None,
                 );
@@ -1816,8 +1814,8 @@ pub struct MetalHeadlessRenderer {
 #[cfg(test)]
 mod gpu_painter_tests {
     use super::*;
+    use gpui::GpuPainter;
     use gpui::{GpuPaintTarget, Quad};
-    use std::any::Any;
 
     struct Painting {
         mode: GpuDrawMode,
@@ -1906,24 +1904,22 @@ mod gpu_painter_tests {
         }
     }
 
-    impl MetalPainter for SolidPainter {
+    impl GpuPainter for SolidPainter {
+        type Snapshot = Painting;
+        fn supports_backend(&self, backend: GpuBackend) -> bool {
+            backend == GpuBackend::Metal
+        }
         fn draw_in_pass(
             &mut self,
-            context: &mut MetalDrawContext<'_>,
-            data: &(dyn Any + Send + Sync),
+            context: &mut GpuPassContext<'_, '_>,
+            painting: &Painting,
         ) -> Result<()> {
-            self.draw(
-                context.encoder,
-                data.downcast_ref::<Painting>().context("painting")?,
-            )
+            let context = context.metal()?;
+            self.draw(context.encoder, painting)
         }
 
-        fn paint(
-            &mut self,
-            context: &mut MetalPaintContext<'_>,
-            data: &(dyn Any + Send + Sync),
-        ) -> Result<()> {
-            let painting = data.downcast_ref::<Painting>().context("painting")?;
+        fn paint(&mut self, context: &mut GpuPaintContext<'_>, painting: &Painting) -> Result<()> {
+            let context = context.metal()?;
             let descriptor = metal::RenderPassDescriptor::new();
             let color = descriptor
                 .color_attachments()

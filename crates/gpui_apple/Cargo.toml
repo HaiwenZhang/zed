@@ -19,7 +19,7 @@ test-support = ["gpui/test-support"]
 runtime_shaders = []
 
 [dependencies]
-gpui.workspace = true
+gpui = { workspace = true, features = ["gpu-metal"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 anyhow.workspace = true

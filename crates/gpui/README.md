@@ -85,15 +85,36 @@ Each of these registers has one or more corresponding contexts that can be acces
 
 ## Custom GPU rendering
 
-Register a backend painter with `Window::register_gpu_painter`, then call
+Implement `gpui::GpuPainter`, register it with `Window::register_gpu_painter`,
+then call
 `Window::paint_gpu(bounds, &handle, snapshot)` during an element's paint phase.
 The handle belongs to one window. The scene retains the immutable snapshot and
 draws the surface in order with ordinary UI primitives, including cached scene
 replays.
 
-The native interfaces are `gpui_apple::MetalPainter`, `gpui_wgpu::WgpuPainter`
-and `gpui_windows::D3D11Painter`, adapted with `metal_painter`, `wgpu_painter`
-and `d3d11_painter`. Each supports these stages:
+`GpuPainter` is the common interface for Metal, wgpu and D3D11. Set its
+`Snapshot` associated type to your immutable application data and implement
+`supports_backend` for the native backends your painter supports. Registration
+returns `GpuPainterHandle<P::Snapshot>`; `paint_gpu` accepts an `Arc` of that same
+type, so mismatched snapshots are rejected at compile time. No backend adapter
+function is needed:
+
+```rust
+let painter = window.register_gpu_painter(CadPainter::default())?;
+window.paint_gpu(bounds, &painter, Arc::new(snapshot))?;
+```
+
+All callbacks use contexts from `gpui`: `GpuPrepareContext`, `GpuPassContext`
+and `GpuPaintContext`. Their `target()` and `capabilities()` methods expose common
+geometry and access information. Match their backend variants, or use the fallible
+`metal()`, `wgpu()` and `d3d11()` accessors to borrow native resources. Shared-pass
+contexts provide Metal and wgpu access only. Backend crates enable the corresponding
+`gpui/gpu-metal`, `gpui/gpu-wgpu` or `gpui/gpu-d3d11` feature. A backend is a graphics
+API, not an OS: wgpu remains `GpuBackend::Wgpu` when it uses Metal internally.
+Applications can keep native drawing code and shaders in platform modules while
+implementing one public painter trait.
+
+The common lifecycle has these stages:
 
 | Stage | Execution | Typical work |
 | --- | --- | --- |
@@ -102,13 +123,16 @@ and `d3d11_painter`. Each supports these stages:
 | `draw_mode` | After the surface finishes preparation | Select shared or independent drawing access |
 | `draw_in_pass` / `paint` | At the surface's position in the scene | Draw or composite with the selected access |
 
-Preparation methods default to success without doing any work. Existing painters
-implementing only `paint` and `reset` continue to work. A preparation error skips
-the surface's remaining stages; errors are logged and available through
+Preparation methods default to success without doing any work. A preparation
+error skips the surface's remaining stages; errors are logged and available through
 `GpuPainterHandle::status()`. Its `encoded` counter counts successful drawing
 callbacks, not preparation, mode selection or GPU completion.
 
-Metal and wgpu painters can select `GpuDrawMode::SharedPass` from `draw_mode`
+`draw_mode` receives the current `GpuCapabilities`. Check
+`capabilities.supports(GpuDrawMode::SharedPass)` before choosing shared access.
+Metal and wgpu support this mode; D3D11 supports `OwnPass` only. An unsupported
+mode skips the surface and records an error instead of silently falling back.
+Painters can select `GpuDrawMode::SharedPass` from `draw_mode`
 and implement `draw_in_pass`. The context borrows the current Metal render encoder
 or wgpu render pass, together with the device, target geometry and color format.
 GPUI sets the viewport to the complete surface bounds and an integer scissor
@@ -119,7 +143,7 @@ It cannot replace attachments or encode other passes. GPUI restores the state
 needed by ordinary UI drawing after success or error; an error does not fall back
 to independent drawing or undo encoded commands.
 
-The default `GpuDrawMode::OwnPass` keeps the existing `paint` callback and ends
+The default `GpuDrawMode::OwnPass` invokes `paint`. Metal and wgpu end
 the UI pass before giving the painter independent encoding access. Shared-only
 painters can omit `paint`; choosing a mode without implementing its callback
 returns an error. Surfaces of both modes execute strictly in scene order rather
