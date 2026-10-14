@@ -4,12 +4,12 @@ mod macos {
     use block2::RcBlock;
     use foreign_types::ForeignTypeRef;
     use gpui::{
-        Bounds, Context, GpuDrawMode, GpuPaintTarget, GpuPainterHandle, GpuResetReason,
-        IntoElement, Render, Styled, Window, WindowBounds, WindowOptions, canvas, div, prelude::*,
-        px, rgb, size,
+        Bounds, Context, GpuPaintTarget, GpuPainterHandle, GpuResetReason, IntoElement, Render,
+        Styled, Window, WindowBounds, WindowOptions, canvas, div, prelude::*, px, rgb, size,
     };
     use gpui_apple::{
-        MetalDrawContext, MetalPaintContext, MetalPainter, MetalPrepareContext, metal_painter,
+        MetalDrawContext, MetalPaintContext, MetalPainter, MetalPrepareContext, MetalSharedPainter,
+        metal_painter, metal_shared_painter,
     };
     use gpui_util::ResultExt;
     use metal::{
@@ -18,7 +18,6 @@ mod macos {
         MTLTextureUsage, MTLViewport,
     };
     use std::{
-        any::Any,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -226,15 +225,13 @@ mod macos {
         }
     }
 
-    impl MetalPainter for CadPainter {
+    impl CadPainter {
         fn prepare(
             &mut self,
             context: &mut MetalPrepareContext<'_>,
-            data: &(dyn Any + Send + Sync),
+            snapshot: &Snapshot,
         ) -> Result<()> {
-            let snapshot = *data
-                .downcast_ref::<Snapshot>()
-                .context("CAD snapshot missing")?;
+            let snapshot = *snapshot;
             if snapshot.mode == RenderMode::Direct {
                 return Ok(());
             }
@@ -342,20 +339,10 @@ mod macos {
             Ok(())
         }
 
-        fn draw_mode(&self, data: &(dyn Any + Send + Sync)) -> GpuDrawMode {
-            match data
-                .downcast_ref::<Snapshot>()
-                .map(|snapshot| snapshot.mode)
-            {
-                Some(RenderMode::Offscreen) => GpuDrawMode::SharedPass,
-                _ => GpuDrawMode::OwnPass,
-            }
-        }
-
         fn draw_in_pass(
             &mut self,
             context: &mut MetalDrawContext<'_>,
-            _data: &(dyn Any + Send + Sync),
+            _snapshot: &Snapshot,
         ) -> Result<()> {
             let resources = self.resources(
                 context.device,
@@ -387,11 +374,9 @@ mod macos {
         fn paint(
             &mut self,
             context: &mut MetalPaintContext<'_>,
-            data: &(dyn Any + Send + Sync),
+            snapshot: &Snapshot,
         ) -> Result<()> {
-            let snapshot = *data
-                .downcast_ref::<Snapshot>()
-                .context("CAD snapshot missing")?;
+            let snapshot = *snapshot;
             anyhow::ensure!(
                 snapshot.mode == RenderMode::Direct,
                 "offscreen composition requires shared-pass access"
@@ -452,10 +437,64 @@ mod macos {
         }
     }
 
+    impl MetalPainter for CadPainter {
+        type Snapshot = Snapshot;
+
+        fn prepare(
+            &mut self,
+            context: &mut MetalPrepareContext<'_>,
+            snapshot: &Snapshot,
+        ) -> Result<()> {
+            CadPainter::prepare(self, context, snapshot)
+        }
+
+        fn paint(
+            &mut self,
+            context: &mut MetalPaintContext<'_>,
+            snapshot: &Snapshot,
+        ) -> Result<()> {
+            CadPainter::paint(self, context, snapshot)
+        }
+
+        fn reset(&mut self, reason: GpuResetReason) {
+            CadPainter::reset(self, reason);
+        }
+    }
+
+    impl MetalSharedPainter for CadPainter {
+        type Snapshot = Snapshot;
+
+        fn prepare(
+            &mut self,
+            context: &mut MetalPrepareContext<'_>,
+            snapshot: &Snapshot,
+        ) -> Result<()> {
+            CadPainter::prepare(self, context, snapshot)
+        }
+
+        fn paint(&mut self, context: &mut MetalDrawContext<'_>, snapshot: &Snapshot) -> Result<()> {
+            CadPainter::draw_in_pass(self, context, snapshot)
+        }
+
+        fn reset(&mut self, reason: GpuResetReason) {
+            CadPainter::reset(self, reason);
+        }
+    }
+
     struct CadView {
-        painter: Option<GpuPainterHandle>,
+        painters: [Option<GpuPainterHandle<Snapshot>>; 2],
         error: Option<String>,
         snapshot: Snapshot,
+    }
+
+    impl CadView {
+        fn painter(&self) -> Option<&GpuPainterHandle<Snapshot>> {
+            let index = match self.snapshot.mode {
+                RenderMode::Direct => 0,
+                RenderMode::Offscreen => 1,
+            };
+            self.painters.get(index).and_then(Option::as_ref)
+        }
     }
 
     struct CadViewport {
@@ -484,7 +523,7 @@ mod macos {
                     })))
                 .child("Click each viewport's mode to switch. Paused offscreen frames reuse the cached texture.")
                 .child(div().flex().flex_1().gap_4().children(self.views.iter().enumerate().map(|(index, view)| {
-                    let painter = view.painter.clone();
+                    let painter = view.painter().cloned();
                     let snapshot = view.snapshot;
                     div().flex().flex_col().flex_1().gap_2().overflow_hidden()
                         .child(div().id(("mode", index)).cursor_pointer()
@@ -495,7 +534,7 @@ mod macos {
                                     cx.notify();
                                 }
                             })))
-                        .child(view.error.clone().or_else(|| view.painter.as_ref().and_then(|painter| painter.status().last_error)).unwrap_or_default())
+                        .child(view.error.clone().or_else(|| view.painter().and_then(|painter| painter.status().last_error)).unwrap_or_default())
                         .child(div().flex_1().overflow_hidden().bg(rgb(0x303945))
                             .child(canvas(|_, _, _| (), move |bounds, _, window, _| {
                                 if let Some(painter) = &painter {
@@ -516,11 +555,16 @@ mod macos {
                 },
                 |window, cx| {
                     let views = [RenderMode::Direct, RenderMode::Offscreen].map(|mode| {
-                        let painter =
-                            window.register_gpu_painter(metal_painter(CadPainter::default()));
-                        let error = painter.as_ref().err().map(|error| format!("{error:#}"));
+                        let painters = [
+                            window.register_gpu_painter(metal_painter(CadPainter::default())),
+                            window
+                                .register_gpu_painter(metal_shared_painter(CadPainter::default())),
+                        ];
+                        let error = painters.iter().find_map(|painter| {
+                            painter.as_ref().err().map(|error| format!("{error:#}"))
+                        });
                         CadView {
-                            painter: painter.log_err(),
+                            painters: painters.map(|painter| painter.log_err()),
                             error,
                             snapshot: Snapshot {
                                 mode,
@@ -612,21 +656,10 @@ mod macos {
                     snapshot,
                 )?;
             }
-            for (painter, snapshot, target) in views.iter_mut() {
-                painter.finish_prepare(
-                    &mut MetalPrepareContext {
-                        target: *target,
-                        device,
-                        command_buffer,
-                        color_format: color.pixel_format(),
-                    },
-                    snapshot,
-                )?;
-            }
             let mut encoder = begin_pass(command_buffer, &color, true)?;
             for (painter, snapshot, target) in views.iter_mut() {
-                let result = match painter.draw_mode(snapshot) {
-                    GpuDrawMode::SharedPass => {
+                let result = match snapshot.mode {
+                    RenderMode::Offscreen => {
                         encoder.set_viewport(viewport(*target));
                         encoder.set_scissor_rect(scissor(*target));
                         painter.draw_in_pass(
@@ -639,7 +672,7 @@ mod macos {
                             snapshot,
                         )
                     }
-                    GpuDrawMode::OwnPass => {
+                    RenderMode::Direct => {
                         encoder.end_encoding();
                         let result = painter.paint(
                             &mut MetalPaintContext {

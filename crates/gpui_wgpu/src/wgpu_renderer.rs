@@ -1,5 +1,5 @@
 use crate::gpu_painter::{
-    WgpuDrawContext, WgpuPaintContext, WgpuPainter, WgpuPainterAdapter, WgpuPrepareContext,
+    AnyWgpuPainter, WgpuDrawContext, WgpuPaintContext, WgpuPainterAdapter, WgpuPrepareContext,
 };
 use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
@@ -1742,7 +1742,7 @@ impl WgpuRendererCore {
 
     fn draw_gpu_in_pass(
         &self,
-        painter: &mut dyn WgpuPainter,
+        painter: &mut dyn AnyWgpuPainter,
         target: GpuPaintTarget,
         data: &(dyn std::any::Any + Send + Sync),
         pass: &mut wgpu::RenderPass<'_>,
@@ -2818,15 +2818,10 @@ mod tests {
     #[test]
     fn shared_pass_restores_ui_state_after_an_encoding_error() -> Result<()> {
         struct SharedPainter(wgpu::RenderPipeline);
-        impl WgpuPainter for SharedPainter {
-            fn draw_mode(&self, _: &(dyn std::any::Any + Send + Sync)) -> GpuDrawMode {
-                GpuDrawMode::SharedPass
-            }
-            fn draw_in_pass(
-                &mut self,
-                context: &mut WgpuDrawContext<'_, '_>,
-                _: &(dyn std::any::Any + Send + Sync),
-            ) -> Result<()> {
+        impl crate::WgpuSharedPainter for SharedPainter {
+            type Snapshot = ();
+
+            fn paint(&mut self, context: &mut WgpuDrawContext<'_, '_>, _: &()) -> Result<()> {
                 context.pass.set_pipeline(&self.0);
                 context.pass.draw(0..6, 0..1);
                 context.pass.set_viewport(0.0, 0.0, 1.0, 1.0, 0.0, 1.0);
@@ -2883,7 +2878,7 @@ mod tests {
             multiview_mask: None,
             cache: None,
         });
-        let mut painter = SharedPainter(pipeline);
+        let mut painter = WgpuPainterAdapter::shared(SharedPainter(pipeline));
         let bounds = |left, top, width, height| {
             Bounds::new(
                 gpui::point(ScaledPixels(left), ScaledPixels(top)),
@@ -2928,7 +2923,7 @@ mod tests {
             });
             let resources = renderer.core.resources();
             let invalid = renderer.core.draw_gpu_in_pass(
-                &mut painter,
+                painter.0.as_mut(),
                 GpuPaintTarget {
                     size: [64, 64],
                     bounds: bounds(
@@ -2953,7 +2948,7 @@ mod tests {
                 &mut pass,
             );
             let result = renderer.core.draw_gpu_in_pass(
-                &mut painter,
+                painter.0.as_mut(),
                 GpuPaintTarget {
                     size: [64, 64],
                     bounds: bounds(16.0, 16.0, 32.0, 32.0),

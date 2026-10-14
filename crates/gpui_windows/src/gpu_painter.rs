@@ -1,5 +1,5 @@
 use anyhow::Result;
-use gpui::{GpuPaintTarget, GpuPainter, GpuResetReason};
+use gpui::{GpuPaintTarget, GpuPainter, GpuPainterBackend, GpuResetReason};
 use std::any::Any;
 
 /// Native D3D11 resources borrowed before scene drawing begins.
@@ -31,61 +31,116 @@ pub struct D3D11PaintContext<'a> {
     pub color_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
 }
 
-/// Application drawing using the window's D3D11 device and color target.
+/// Independent-pass drawing using the window's native D3D11 resources.
 pub trait D3D11Painter: Send + 'static {
-    /// Prepares resources before any ordinary scene drawing.
-    ///
-    /// Called once per visible surface and frame encoding attempt, including scene
-    /// replays. All surfaces prepare before any surface finishes preparation.
-    /// Surfaces sharing this painter may have different snapshots: retain separate
-    /// buffer ranges or resources when their draws need different prepared data.
-    /// An error skips this surface's remaining stages and is recorded in its handle.
+    /// Immutable application data retained by the scene, including scene replays.
+    type Snapshot: Send + Sync + 'static;
+
+    /// Prepares resources before ordinary scene drawing, once per visible surface.
+    /// All surfaces prepare before drawing. Keep separate resources or buffer ranges
+    /// for different snapshots sharing this painter. Errors skip the remaining stages.
     fn prepare(
         &mut self,
         _context: &mut D3D11PrepareContext<'_>,
-        _data: &(dyn Any + Send + Sync),
+        _snapshot: &Self::Snapshot,
     ) -> Result<()> {
         Ok(())
     }
 
     /// Runs after all surfaces have prepared, before ordinary scene drawing.
-    ///
-    /// Called once per surface whose preparation succeeded. An error skips its draw.
+    /// Called once per successfully prepared surface; an error skips its drawing.
     fn finish_prepare(
         &mut self,
         _context: &mut D3D11PrepareContext<'_>,
-        _data: &(dyn Any + Send + Sync),
+        _snapshot: &Self::Snapshot,
     ) -> Result<()> {
         Ok(())
     }
 
-    /// Encodes drawing into the current frame.
-    ///
-    /// Preserve existing color, restrict writes to `context.target.clip`, and apply
-    /// `context.target.opacity`. End application encoders before returning, including
-    /// on error; errors do not undo commands already encoded.
-    ///
-    /// Do not submit or present the frame, retain frame targets, use the context on
-    /// another thread, or reenter GPUI. Success indicates encoding, not GPU completion.
+    /// Draws at this surface's position in the scene.
+    /// Preserve existing color, obey the inherited clip and apply target opacity.
+    /// Do not submit, present, retain frame resources or reenter GPUI. End any
+    /// application encoders before returning, including on error. Encoded commands
+    /// are not rolled back by an error; success does not mean GPU completion.
     fn paint(
         &mut self,
         context: &mut D3D11PaintContext<'_>,
-        data: &(dyn Any + Send + Sync),
+        snapshot: &Self::Snapshot,
     ) -> Result<()>;
 
-    /// Releases resources before the window's device or renderer is retired.
-    /// After device replacement, recreate resources in the next preparation or drawing callback.
+    /// Releases resources before device replacement or window destruction.
+    /// Resize does not reset the painter. Recreate resources on the next callback.
     fn reset(&mut self, reason: GpuResetReason);
 }
 
-/// Adapts a D3D11 painter for [`gpui::Window::register_gpu_painter`].
-pub fn d3d11_painter(painter: impl D3D11Painter) -> impl GpuPainter {
-    D3D11PainterAdapter(Box::new(painter))
+/// Registers independent-pass drawing with typed application snapshots.
+pub fn d3d11_painter<P: D3D11Painter>(painter: P) -> GpuPainter<P::Snapshot> {
+    GpuPainter::new(D3D11PainterAdapter(Box::new(IndependentPainter(painter))))
 }
 
-pub(crate) struct D3D11PainterAdapter(pub(crate) Box<dyn D3D11Painter>);
+pub(crate) struct D3D11PainterAdapter(pub(crate) Box<dyn AnyD3D11Painter>);
 
-impl GpuPainter for D3D11PainterAdapter {
+impl GpuPainterBackend for D3D11PainterAdapter {
+    fn reset(&mut self, reason: GpuResetReason) {
+        self.0.reset(reason);
+    }
+}
+
+pub(crate) trait AnyD3D11Painter: Send {
+    fn prepare(
+        &mut self,
+        context: &mut D3D11PrepareContext<'_>,
+        snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()>;
+    fn finish_prepare(
+        &mut self,
+        context: &mut D3D11PrepareContext<'_>,
+        snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()>;
+    fn paint(
+        &mut self,
+        context: &mut D3D11PaintContext<'_>,
+        snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()>;
+    fn reset(&mut self, reason: GpuResetReason);
+}
+
+struct IndependentPainter<P>(P);
+
+impl<P: D3D11Painter> AnyD3D11Painter for IndependentPainter<P> {
+    fn prepare(
+        &mut self,
+        context: &mut D3D11PrepareContext<'_>,
+        snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        let snapshot = snapshot
+            .downcast_ref::<P::Snapshot>()
+            .ok_or_else(|| anyhow::anyhow!("GPU painter snapshot type mismatch"))?;
+        self.0.prepare(context, snapshot)
+    }
+
+    fn finish_prepare(
+        &mut self,
+        context: &mut D3D11PrepareContext<'_>,
+        snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        let snapshot = snapshot
+            .downcast_ref::<P::Snapshot>()
+            .ok_or_else(|| anyhow::anyhow!("GPU painter snapshot type mismatch"))?;
+        self.0.finish_prepare(context, snapshot)
+    }
+
+    fn paint(
+        &mut self,
+        context: &mut D3D11PaintContext<'_>,
+        snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        let snapshot = snapshot
+            .downcast_ref::<P::Snapshot>()
+            .ok_or_else(|| anyhow::anyhow!("GPU painter snapshot type mismatch"))?;
+        self.0.paint(context, snapshot)
+    }
+
     fn reset(&mut self, reason: GpuResetReason) {
         self.0.reset(reason);
     }

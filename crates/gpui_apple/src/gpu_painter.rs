@@ -1,5 +1,5 @@
 use anyhow::Result;
-use gpui::{GpuDrawMode, GpuPaintTarget, GpuPainter, GpuResetReason};
+use gpui::{GpuDrawMode, GpuPaintTarget, GpuPainter, GpuPainterBackend, GpuResetReason};
 use std::any::Any;
 
 /// Native Metal resources borrowed before scene drawing begins.
@@ -20,7 +20,7 @@ pub struct MetalPrepareContext<'a> {
 /// Native Metal drawing access within GPUI's current UI pass.
 ///
 /// GPUI sets the viewport and scissor before drawing. Attachments cannot be
-/// replaced; use [`GpuDrawMode::OwnPass`] for depth, multisampling or other passes.
+/// replaced; use [`metal_painter`] for depth, multisampling or other passes.
 /// Do not end the pass, retain its resources, or reenter GPUI.
 pub struct MetalDrawContext<'a> {
     /// Target geometry and inherited opacity; apply opacity when writing color.
@@ -47,87 +47,226 @@ pub struct MetalPaintContext<'a> {
     pub color_format: metal::MTLPixelFormat,
 }
 
-/// Application drawing using the window's Metal device and color target.
+/// Independent-pass drawing using the window's native Metal resources.
 pub trait MetalPainter: Send + 'static {
-    /// Prepares resources before any ordinary scene drawing.
-    ///
-    /// Called once per visible surface and frame encoding attempt, including scene
-    /// replays. All surfaces prepare before any surface finishes preparation.
-    /// Surfaces sharing this painter may have different snapshots: retain separate
-    /// buffer ranges or resources when their draws need different prepared data.
-    /// An error skips this surface's remaining stages and is recorded in its handle.
+    /// Immutable application data retained by the scene, including scene replays.
+    type Snapshot: Send + Sync + 'static;
+
+    /// Prepares resources before ordinary scene drawing, once per visible surface.
+    /// All surfaces prepare before drawing. Keep separate resources or buffer ranges
+    /// for different snapshots sharing this painter. Errors skip the remaining stages.
     fn prepare(
         &mut self,
         _context: &mut MetalPrepareContext<'_>,
-        _data: &(dyn Any + Send + Sync),
+        _snapshot: &Self::Snapshot,
     ) -> Result<()> {
         Ok(())
     }
 
     /// Runs after all surfaces have prepared, before ordinary scene drawing.
-    ///
-    /// Called once per surface whose preparation succeeded. An error skips its draw.
+    /// Called once per successfully prepared surface; an error skips its drawing.
     fn finish_prepare(
         &mut self,
         _context: &mut MetalPrepareContext<'_>,
-        _data: &(dyn Any + Send + Sync),
+        _snapshot: &Self::Snapshot,
     ) -> Result<()> {
         Ok(())
     }
 
-    /// Selects access after this surface finishes preparation.
-    ///
-    /// This method only selects a mode; it must not encode drawing or reenter GPUI.
-    /// The default preserves existing independent-pass painters.
-    fn draw_mode(&self, _data: &(dyn Any + Send + Sync)) -> GpuDrawMode {
-        GpuDrawMode::OwnPass
-    }
-
-    /// Draws into the existing UI pass when [`Self::draw_mode`] selects shared access.
-    ///
-    /// Apply `context.target.opacity` and preserve GPUI's existing color. GPUI
-    /// restores its drawing state after success or error. Do not end the pass,
-    /// leave queries active, retain frame resources, or reenter GPUI. Errors do not
-    /// undo commands already encoded and do not fall back to [`Self::paint`].
-    fn draw_in_pass(
-        &mut self,
-        _context: &mut MetalDrawContext<'_>,
-        _data: &(dyn Any + Send + Sync),
-    ) -> Result<()> {
-        anyhow::bail!("Shared-pass drawing is not implemented by this painter")
-    }
-
-    /// Encodes independent passes when [`Self::draw_mode`] selects own-pass access.
-    ///
-    /// Preserve existing color, restrict writes to `context.target.clip`, and apply
-    /// `context.target.opacity`. End application encoders before returning, including
-    /// on error; errors do not undo commands already encoded.
-    ///
-    /// Do not submit or present the frame, retain frame targets, use the context on
-    /// another thread, or reenter GPUI. Success indicates encoding, not GPU completion.
+    /// Draws at this surface's position in the scene.
+    /// Preserve existing color, obey the inherited clip and apply target opacity.
+    /// Do not submit, present, retain frame resources or reenter GPUI. End any
+    /// application encoders before returning, including on error. Encoded commands
+    /// are not rolled back by an error; success does not mean GPU completion.
     fn paint(
         &mut self,
-        _context: &mut MetalPaintContext<'_>,
-        _data: &(dyn Any + Send + Sync),
-    ) -> Result<()> {
-        anyhow::bail!("Independent-pass drawing is not implemented by this painter")
-    }
+        context: &mut MetalPaintContext<'_>,
+        snapshot: &Self::Snapshot,
+    ) -> Result<()>;
 
-    /// Releases resources before the window's device or renderer is retired.
-    /// After device replacement, recreate resources in the next preparation or drawing callback.
+    /// Releases resources before device replacement or window destruction.
+    /// Resize does not reset the painter. Recreate resources on the next callback.
     fn reset(&mut self, reason: GpuResetReason);
 }
 
-/// Adapts a Metal painter for [`gpui::Window::register_gpu_painter`].
-pub fn metal_painter(painter: impl MetalPainter) -> impl GpuPainter {
-    MetalPainterAdapter(Box::new(painter))
+/// Drawing in GPUI's existing Metal UI pass.
+/// Attachments cannot be replaced. Leave the pass open; GPUI restores UI state.
+pub trait MetalSharedPainter: Send + 'static {
+    /// Immutable application data retained by the scene, including scene replays.
+    type Snapshot: Send + Sync + 'static;
+
+    /// Prepares resources before ordinary scene drawing, once per visible surface.
+    /// All surfaces prepare before drawing. Keep separate resources or buffer ranges
+    /// for different snapshots sharing this painter. Errors skip the remaining stages.
+    fn prepare(
+        &mut self,
+        _context: &mut MetalPrepareContext<'_>,
+        _snapshot: &Self::Snapshot,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Runs after all surfaces have prepared, before ordinary scene drawing.
+    /// Called once per successfully prepared surface; an error skips its drawing.
+    fn finish_prepare(
+        &mut self,
+        _context: &mut MetalPrepareContext<'_>,
+        _snapshot: &Self::Snapshot,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Draws at this surface's position in the scene.
+    /// Preserve existing color, obey the inherited clip and apply target opacity.
+    /// Do not submit, present, retain frame resources or reenter GPUI. End any
+    /// application encoders before returning, including on error. Encoded commands
+    /// are not rolled back by an error; success does not mean GPU completion.
+    fn paint(
+        &mut self,
+        context: &mut MetalDrawContext<'_>,
+        snapshot: &Self::Snapshot,
+    ) -> Result<()>;
+
+    /// Releases resources before device replacement or window destruction.
+    /// Resize does not reset the painter. Recreate resources on the next callback.
+    fn reset(&mut self, reason: GpuResetReason);
 }
 
-pub(crate) struct MetalPainterAdapter(pub(crate) Box<dyn MetalPainter>);
+/// Registers independent-pass drawing with typed application snapshots.
+pub fn metal_painter<P: MetalPainter>(painter: P) -> GpuPainter<P::Snapshot> {
+    GpuPainter::new(MetalPainterAdapter::independent(painter))
+}
 
-impl GpuPainter for MetalPainterAdapter {
-    fn draw_mode(&self, data: &(dyn Any + Send + Sync)) -> GpuDrawMode {
-        self.0.draw_mode(data)
+/// Registers shared-pass drawing with typed application snapshots.
+pub fn metal_shared_painter<P: MetalSharedPainter>(painter: P) -> GpuPainter<P::Snapshot> {
+    GpuPainter::new(MetalPainterAdapter::shared(painter))
+}
+
+pub(crate) struct MetalPainterAdapter(pub(crate) Box<dyn AnyMetalPainter>, GpuDrawMode);
+
+impl MetalPainterAdapter {
+    pub(crate) fn independent<P: MetalPainter>(painter: P) -> Self {
+        Self(Box::new(IndependentPainter(painter)), GpuDrawMode::OwnPass)
+    }
+
+    pub(crate) fn shared<P: MetalSharedPainter>(painter: P) -> Self {
+        Self(Box::new(SharedPainter(painter)), GpuDrawMode::SharedPass)
+    }
+}
+
+impl GpuPainterBackend for MetalPainterAdapter {
+    fn draw_mode(&self) -> GpuDrawMode {
+        self.1
+    }
+
+    fn reset(&mut self, reason: GpuResetReason) {
+        self.0.reset(reason);
+    }
+}
+
+pub(crate) trait AnyMetalPainter: Send {
+    fn prepare(
+        &mut self,
+        context: &mut MetalPrepareContext<'_>,
+        snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()>;
+    fn finish_prepare(
+        &mut self,
+        context: &mut MetalPrepareContext<'_>,
+        snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()>;
+    fn paint(
+        &mut self,
+        _context: &mut MetalPaintContext<'_>,
+        _snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        anyhow::bail!("Independent-pass access requested for a shared painter")
+    }
+    fn draw_in_pass(
+        &mut self,
+        _context: &mut MetalDrawContext<'_>,
+        _snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        anyhow::bail!("Shared-pass access requested for an independent painter")
+    }
+    fn reset(&mut self, reason: GpuResetReason);
+}
+
+struct IndependentPainter<P>(P);
+
+impl<P: MetalPainter> AnyMetalPainter for IndependentPainter<P> {
+    fn prepare(
+        &mut self,
+        context: &mut MetalPrepareContext<'_>,
+        snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        let snapshot = snapshot
+            .downcast_ref::<P::Snapshot>()
+            .ok_or_else(|| anyhow::anyhow!("GPU painter snapshot type mismatch"))?;
+        self.0.prepare(context, snapshot)
+    }
+
+    fn finish_prepare(
+        &mut self,
+        context: &mut MetalPrepareContext<'_>,
+        snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        let snapshot = snapshot
+            .downcast_ref::<P::Snapshot>()
+            .ok_or_else(|| anyhow::anyhow!("GPU painter snapshot type mismatch"))?;
+        self.0.finish_prepare(context, snapshot)
+    }
+
+    fn paint(
+        &mut self,
+        context: &mut MetalPaintContext<'_>,
+        snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        let snapshot = snapshot
+            .downcast_ref::<P::Snapshot>()
+            .ok_or_else(|| anyhow::anyhow!("GPU painter snapshot type mismatch"))?;
+        self.0.paint(context, snapshot)
+    }
+
+    fn reset(&mut self, reason: GpuResetReason) {
+        self.0.reset(reason);
+    }
+}
+
+struct SharedPainter<P>(P);
+
+impl<P: MetalSharedPainter> AnyMetalPainter for SharedPainter<P> {
+    fn prepare(
+        &mut self,
+        context: &mut MetalPrepareContext<'_>,
+        snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        let snapshot = snapshot
+            .downcast_ref::<P::Snapshot>()
+            .ok_or_else(|| anyhow::anyhow!("GPU painter snapshot type mismatch"))?;
+        self.0.prepare(context, snapshot)
+    }
+
+    fn finish_prepare(
+        &mut self,
+        context: &mut MetalPrepareContext<'_>,
+        snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        let snapshot = snapshot
+            .downcast_ref::<P::Snapshot>()
+            .ok_or_else(|| anyhow::anyhow!("GPU painter snapshot type mismatch"))?;
+        self.0.finish_prepare(context, snapshot)
+    }
+
+    fn draw_in_pass(
+        &mut self,
+        context: &mut MetalDrawContext<'_>,
+        snapshot: &(dyn Any + Send + Sync),
+    ) -> Result<()> {
+        let snapshot = snapshot
+            .downcast_ref::<P::Snapshot>()
+            .ok_or_else(|| anyhow::anyhow!("GPU painter snapshot type mismatch"))?;
+        self.0.paint(context, snapshot)
     }
 
     fn reset(&mut self, reason: GpuResetReason) {

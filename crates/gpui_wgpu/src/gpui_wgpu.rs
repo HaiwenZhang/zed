@@ -6,7 +6,8 @@ mod wgpu_renderer;
 
 pub use cosmic_text_system::*;
 pub use gpu_painter::{
-    WgpuDrawContext, WgpuPaintContext, WgpuPainter, WgpuPrepareContext, wgpu_painter,
+    WgpuDrawContext, WgpuPaintContext, WgpuPainter, WgpuPrepareContext, WgpuSharedPainter,
+    wgpu_painter, wgpu_shared_painter,
 };
 pub use wgpu;
 pub use wgpu_atlas::*;

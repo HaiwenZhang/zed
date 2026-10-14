@@ -85,47 +85,43 @@ Each of these registers has one or more corresponding contexts that can be acces
 
 ## Custom GPU rendering
 
-Register a backend painter with `Window::register_gpu_painter`, then call
-`Window::paint_gpu(bounds, &handle, snapshot)` during an element's paint phase.
-The handle belongs to one window. The scene retains the immutable snapshot and
-draws the surface in order with ordinary UI primitives, including cached scene
-replays.
+Register a native painter with `Window::register_gpu_painter`, then call
+`Window::paint_gpu(bounds, &handle, Arc::new(snapshot))` during an element's paint
+phase. Native painters declare `type Snapshot`; the returned
+`GpuPainterHandle<Snapshot>` accepts only that type. Snapshots need not implement
+`Clone`. The scene retains them, including cached scene replays.
 
-The native interfaces are `gpui_apple::MetalPainter`, `gpui_wgpu::WgpuPainter`
-and `gpui_windows::D3D11Painter`, adapted with `metal_painter`, `wgpu_painter`
-and `d3d11_painter`. Each supports these stages:
+Each platform uses its own shaders and rendering implementation:
+`gpui_apple::MetalPainter`, `gpui_windows::D3D11Painter` and
+`gpui_wgpu::WgpuPainter`. Register independent-pass drawing with `metal_painter`,
+`d3d11_painter` or `wgpu_painter`. Implement `paint` and `reset`; `prepare` and
+`finish_prepare` are optional.
 
 | Stage | Execution | Typical work |
 | --- | --- | --- |
 | `prepare` | Before ordinary scene drawing, once per visible surface | Upload geometry, allocate targets, run compute or offscreen passes |
-| `finish_prepare` | After all surfaces have prepared, once per successfully prepared surface | Work that depends on preparation of other surfaces |
-| `draw_mode` | After the surface finishes preparation | Select shared or independent drawing access |
-| `draw_in_pass` / `paint` | At the surface's position in the scene | Draw or composite with the selected access |
+| `finish_prepare` | After all surfaces have prepared, once per successfully prepared surface | Work depending on other surfaces' preparation |
+| `paint` | At the surface's position in the scene | Draw directly or composite offscreen output |
 
-Preparation methods default to success without doing any work. Existing painters
-implementing only `paint` and `reset` continue to work. A preparation error skips
-the surface's remaining stages; errors are logged and available through
-`GpuPainterHandle::status()`. Its `encoded` counter counts successful drawing
-callbacks, not preparation, mode selection or GPU completion.
+For shared-pass drawing, implement `MetalSharedPainter` or `WgpuSharedPainter`
+and register with `metal_shared_painter` or `wgpu_shared_painter`. Their required
+`paint` method receives the existing render encoder or render pass. Drawing access
+is fixed at registration; switch handles to switch access. D3D11 uses its
+state-isolated native context through `D3D11Painter`.
 
-Metal and wgpu painters can select `GpuDrawMode::SharedPass` from `draw_mode`
-and implement `draw_in_pass`. The context borrows the current Metal render encoder
-or wgpu render pass, together with the device, target geometry and color format.
-GPUI sets the viewport to the complete surface bounds and an integer scissor
+A preparation error skips the surface's remaining stages. Errors are logged and
+retained in `handle.status().last_error` until consumed with `handle.take_error()`;
+a successful draw of another surface does not clear them. These diagnostics track
+callback errors, not asynchronous device faults. The `encoded` counter counts
+successful drawing callbacks, not GPU completion.
+
+GPUI sets the shared-pass viewport to the complete surface bounds and the scissor
 inside the inherited clip; `GpuPaintTarget::scissor_rect()` exposes that conversion.
 Apply `target.opacity` when writing color. Shared drawing must preserve existing
-color, match the current target format and sample count, and leave the pass open.
-It cannot replace attachments or encode other passes. GPUI restores the state
-needed by ordinary UI drawing after success or error; an error does not fall back
-to independent drawing or undo encoded commands.
-
-The default `GpuDrawMode::OwnPass` keeps the existing `paint` callback and ends
-the UI pass before giving the painter independent encoding access. Shared-only
-painters can omit `paint`; choosing a mode without implementing its callback
-returns an error. Surfaces of both modes execute strictly in scene order rather
-than being regrouped by mode. Mode selection runs again for every encoding
-attempt, including scene replays. D3D11 continues using its state-isolated native
-context through `paint`.
+color, match the target format and sample count, and leave the pass open. It cannot
+replace attachments or encode other passes. GPUI restores UI drawing state after
+success or error. Errors do not undo encoded commands. Surfaces execute in scene
+order, including when independent and shared drawing are interleaved.
 
 For direct rendering, use the provided command encoder/buffer or D3D11 context
 to create your own pass targeting the window's color attachment. Preserve its
@@ -136,8 +132,8 @@ sample count. GPUI resumes ordinary UI rendering after your callback.
 
 For an offscreen CAD viewport, own the color, depth, multisample and any picking
 attachments in your painter. Render them during preparation, resolve multisampled
-color if needed, and composite the result with `draw_in_pass` in the existing UI
-pass, or with `paint` when independent passes are needed. Offscreen attachments
+color if needed, and composite the result with a shared painter's `paint` in the existing UI
+pass, or with an independent painter's `paint` when other passes are needed. Offscreen attachments
 can use a different resolution and sample count from the window. Apply clipping
 and inherited opacity during the final composition. Additional passes can also
 be encoded during `paint` when they must execute at that position in the scene.
@@ -166,8 +162,8 @@ cargo run -p gpui_apple --example cad_viewport --features runtime_shaders
 ```
 
 Click each viewport's rendering mode to switch paths and pause animation to reuse
-offscreen results. Each viewport registers a separate painter so camera data,
-depth attachments and offscreen caches remain independent. Shader, pipeline and
+offscreen results. Each viewport registers independent and shared painters separately, so camera
+data, depth attachments and offscreen caches remain independent. Shader, pipeline and
 immutable model resources can be shared by application-owned caches when the
 device and pipeline configuration match.
 

@@ -7,21 +7,15 @@ use parking_lot::Mutex;
 use std::{
     any::Any,
     fmt,
+    marker::PhantomData,
     sync::{Arc, Weak},
 };
 
-/// The lifecycle of a painter registered with a window's GPU backend.
-///
-/// Backend crates provide adapters that implement this trait and expose their native
-/// drawing callbacks. Pass an adapter to [`crate::Window::register_gpu_painter`] and
-/// queue drawing with [`crate::Window::paint_gpu`].
-pub trait GpuPainter: Any + Send {
-    /// Selects drawing access for a successfully prepared surface.
-    ///
-    /// Called after this surface finishes preparation, before scene drawing. Do
-    /// not encode commands or reenter GPUI here. Backend adapters delegate this
-    /// choice to their native painter; existing painters use independent passes.
-    fn draw_mode(&self, _data: &(dyn Any + Send + Sync)) -> GpuDrawMode {
+/// Backend adapter used to register native drawing callbacks.
+#[doc(hidden)]
+pub trait GpuPainterBackend: Any + Send {
+    /// Drawing access fixed by the native registration adapter.
+    fn draw_mode(&self) -> GpuDrawMode {
         GpuDrawMode::OwnPass
     }
 
@@ -30,6 +24,72 @@ pub trait GpuPainter: Any + Send {
     /// Resize alone does not call this method. After [`GpuResetReason::DeviceReplaced`],
     /// recreate resources on the device supplied to the next preparation or drawing callback.
     fn reset(&mut self, reason: GpuResetReason);
+}
+
+/// A native painter awaiting registration, accepting snapshots of type `Snapshot`.
+///
+/// Construct with the painter adapters exported by the native backend crates.
+pub struct GpuPainter<Snapshot> {
+    painter: Box<dyn GpuPainterBackend>,
+    snapshot: PhantomData<fn(Snapshot) -> Snapshot>,
+}
+
+impl<Snapshot: Send + Sync + 'static> GpuPainter<Snapshot> {
+    #[doc(hidden)]
+    pub fn new(painter: impl GpuPainterBackend) -> Self {
+        Self {
+            painter: Box::new(painter),
+            snapshot: PhantomData,
+        }
+    }
+
+    pub(crate) fn register(
+        self,
+        owner: AnyWindowHandle,
+    ) -> (GpuPainterHandle<Snapshot>, GpuPainterRegistration) {
+        let (handle, registration) = AnyGpuPainterHandle::from_box(owner, self.painter);
+        (
+            GpuPainterHandle {
+                handle,
+                snapshot: PhantomData,
+            },
+            registration,
+        )
+    }
+}
+
+/// A window-scoped native painter accepting snapshots of type `Snapshot`.
+pub struct GpuPainterHandle<Snapshot> {
+    pub(crate) handle: AnyGpuPainterHandle,
+    snapshot: PhantomData<fn(Snapshot) -> Snapshot>,
+}
+
+impl<Snapshot> Clone for GpuPainterHandle<Snapshot> {
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            snapshot: PhantomData,
+        }
+    }
+}
+
+impl<Snapshot> fmt::Debug for GpuPainterHandle<Snapshot> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.handle.fmt(formatter)
+    }
+}
+
+impl<Snapshot> GpuPainterHandle<Snapshot> {
+    /// Returns encoding diagnostics. Do not call from this painter's callbacks.
+    pub fn status(&self) -> GpuPainterStatus {
+        self.handle.status()
+    }
+
+    /// Takes the latest callback error. Successful draws do not clear errors.
+    /// Do not call from this painter's callbacks.
+    pub fn take_error(&self) -> Option<String> {
+        self.handle.take_error()
+    }
 }
 
 /// The drawing access requested by an application GPU painter.
@@ -94,23 +154,24 @@ pub struct GpuPainterStatus {
     pub encoded: u64,
     /// Lifecycle notifications.
     pub resets: u64,
-    /// Most recent preparation or drawing error, cleared by the next successful draw.
+    /// Most recent preparation or drawing error, retained until explicitly taken.
     pub last_error: Option<String>,
 }
 
 struct PainterState {
-    painter: Box<dyn GpuPainter>,
+    painter: Box<dyn GpuPainterBackend>,
     status: GpuPainterStatus,
 }
 
-/// Window-scoped registration retained by referencing scenes.
+/// Type-erased registration retained by referencing scenes.
+#[doc(hidden)]
 #[derive(Clone)]
-pub struct GpuPainterHandle {
+pub struct AnyGpuPainterHandle {
     owner: AnyWindowHandle,
     state: Arc<Mutex<PainterState>>,
 }
 
-impl fmt::Debug for GpuPainterHandle {
+impl fmt::Debug for AnyGpuPainterHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("GpuPainterHandle")
@@ -119,13 +180,21 @@ impl fmt::Debug for GpuPainterHandle {
     }
 }
 
-impl GpuPainterHandle {
+impl AnyGpuPainterHandle {
+    #[cfg(test)]
     pub(crate) fn new(
         owner: AnyWindowHandle,
-        painter: impl GpuPainter,
+        painter: impl GpuPainterBackend,
+    ) -> (Self, GpuPainterRegistration) {
+        Self::from_box(owner, Box::new(painter))
+    }
+
+    fn from_box(
+        owner: AnyWindowHandle,
+        painter: Box<dyn GpuPainterBackend>,
     ) -> (Self, GpuPainterRegistration) {
         let state = Arc::new(Mutex::new(PainterState {
-            painter: Box::new(painter),
+            painter,
             status: GpuPainterStatus::default(),
         }));
         let registration = GpuPainterRegistration(Arc::downgrade(&state));
@@ -144,12 +213,19 @@ impl GpuPainterHandle {
         self.state.lock().status.clone()
     }
 
+    pub fn take_error(&self) -> Option<String> {
+        self.state.lock().status.last_error.take()
+    }
+
     #[doc(hidden)]
-    pub fn invoke<T: GpuPainter>(&self, paint: impl FnOnce(&mut T) -> Result<()>) -> Result<()> {
+    pub fn invoke<T: GpuPainterBackend>(
+        &self,
+        paint: impl FnOnce(&mut T) -> Result<()>,
+    ) -> Result<()> {
         self.invoke_callback(paint, true)
     }
 
-    fn invoke_callback<T: GpuPainter>(
+    fn invoke_callback<T: GpuPainterBackend>(
         &self,
         callback: impl FnOnce(&mut T) -> Result<()>,
         records_encoding: bool,
@@ -165,7 +241,6 @@ impl GpuPainterHandle {
         match &result {
             Ok(()) if records_encoding => {
                 state.status.encoded = state.status.encoded.saturating_add(1);
-                state.status.last_error = None;
             }
             Err(error) => state.status.last_error = Some(format!("{error:#}")),
             Ok(()) => {}
@@ -208,7 +283,7 @@ impl GpuPaintPreparation {
 /// surfaces are excluded from subsequent stages. Call again when encoding a replay
 /// or retry of the scene; readiness must not be reused across frames.
 #[doc(hidden)]
-pub fn prepare_gpu_paints<T: GpuPainter>(
+pub fn prepare_gpu_paints<T: GpuPainterBackend>(
     surfaces: &[GpuPaintSurface],
     size: [u32; 2],
     sample_count: u32,
@@ -251,7 +326,7 @@ pub fn prepare_gpu_paints<T: GpuPainter>(
                         |painter| {
                             callback(painter, &surface.draw, *target, phase)?;
                             if phase == GpuPreparationPhase::FinishPrepare {
-                                *mode = Some(painter.draw_mode(surface.draw.data.as_ref()));
+                                *mode = Some(painter.draw_mode());
                             }
                             Ok(())
                         },
@@ -272,7 +347,7 @@ pub struct GpuPainterRegistration(Weak<Mutex<PainterState>>);
 
 impl GpuPainterRegistration {
     /// Checks that this registration uses the renderer's native adapter.
-    pub fn is<T: GpuPainter>(&self) -> bool {
+    pub fn is<T: GpuPainterBackend>(&self) -> bool {
         self.0.upgrade().is_some_and(|state| {
             let state = state.lock();
             (state.painter.as_ref() as &dyn Any).is::<T>()
@@ -323,7 +398,7 @@ impl Drop for GpuPainterRegistry {
 #[derive(Clone)]
 pub struct GpuPaintPrimitive {
     /// Window-scoped painter.
-    pub handle: GpuPainterHandle,
+    pub handle: AnyGpuPainterHandle,
     /// Application snapshot.
     pub data: Arc<dyn Any + Send + Sync>,
     /// Logical to physical scale at scene construction.
@@ -369,9 +444,9 @@ impl GpuPaintPrimitive {
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuDrawMode, GpuPaintPrimitive, GpuPaintTarget, GpuPainter, GpuPainterHandle,
-        GpuPainterRegistration, GpuPainterRegistry, GpuPainterStatus, GpuPreparationPhase,
-        GpuResetReason, PainterState, prepare_gpu_paints,
+        AnyGpuPainterHandle as GpuPainterHandle, GpuDrawMode, GpuPaintPrimitive, GpuPaintTarget,
+        GpuPainterBackend as GpuPainter, GpuPainterRegistration, GpuPainterRegistry,
+        GpuPainterStatus, GpuPreparationPhase, GpuResetReason, PainterState, prepare_gpu_paints,
     };
     use crate::{
         Bounds, ContentMask, Context, GpuPaintSurface, IntoElement, PrimitiveBatch, Quad, Render,
@@ -396,6 +471,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn typed_handles_clone_without_cloning_snapshots() {
+        struct Snapshot;
+        let owner = WindowHandle::<TestView>::new(WindowId::default()).into();
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let painter = super::GpuPainter::<Snapshot>::new(RecordingPainter(reasons.clone()));
+        let (handle, registration) = painter.register(owner);
+        let clone: super::GpuPainterHandle<Snapshot> = handle.clone();
+        let registry = GpuPainterRegistry::default();
+        registry.register(registration);
+        drop(handle);
+        registry.reset(GpuResetReason::DeviceReplaced);
+        assert_eq!(clone.status().resets, 1);
+        assert_eq!(*reasons.lock(), [GpuResetReason::DeviceReplaced]);
+    }
+
+    #[test]
+    fn successful_surface_does_not_clear_another_surfaces_preparation_error() {
+        let owner = WindowHandle::<TestView>::new(WindowId::default()).into();
+        let (handle, _) =
+            GpuPainterHandle::new(owner, RecordingPainter(Arc::new(Mutex::new(Vec::new()))));
+        let mut surfaces = [recording_surface(1), recording_surface(2)];
+        for surface in &mut surfaces {
+            surface.draw.handle = handle.clone();
+        }
+        let preparation =
+            prepare_gpu_paints::<RecordingPainter>(&surfaces, [100, 100], 1, |_, draw, _, _| {
+                if draw.data.downcast_ref::<u32>() == Some(&1) {
+                    anyhow::bail!("first surface failed");
+                }
+                Ok(())
+            });
+        assert!(!preparation.is_ready(0));
+        assert!(preparation.is_ready(1));
+        handle
+            .invoke::<RecordingPainter>(|_| Ok(()))
+            .expect("second surface draws");
+        assert_eq!(handle.status().encoded, 1);
+        assert_eq!(
+            handle.status().last_error.as_deref(),
+            Some("first surface failed")
+        );
+        assert_eq!(handle.take_error().as_deref(), Some("first surface failed"));
+        assert!(handle.take_error().is_none());
+    }
+
     fn recording_surface(snapshot: u32) -> GpuPaintSurface {
         let owner = WindowHandle::<TestView>::new(WindowId::default()).into();
         let (handle, _) =
@@ -418,76 +539,40 @@ mod tests {
     }
 
     #[test]
-    fn draw_modes_are_selected_after_preparation_for_each_encoding_attempt() {
-        struct SelectingPainter {
-            mode: GpuDrawMode,
-            selections: Arc<Mutex<Vec<GpuDrawMode>>>,
-        }
-        impl GpuPainter for SelectingPainter {
-            fn draw_mode(&self, _: &(dyn std::any::Any + Send + Sync)) -> GpuDrawMode {
-                self.selections.lock().push(self.mode);
-                self.mode
+    fn registered_modes_are_preserved_across_preparation_and_scene_replays() {
+        struct FixedPainter(GpuDrawMode);
+        impl GpuPainter for FixedPainter {
+            fn draw_mode(&self) -> GpuDrawMode {
+                self.0
             }
             fn reset(&mut self, _: GpuResetReason) {}
         }
 
-        let selections = Arc::new(Mutex::new(Vec::new()));
         let owner = WindowHandle::<TestView>::new(WindowId::default()).into();
-        let (handle, _) = GpuPainterHandle::new(
-            owner,
-            SelectingPainter {
-                mode: GpuDrawMode::OwnPass,
-                selections: selections.clone(),
-            },
-        );
         let mut surfaces = [
             recording_surface(1),
             recording_surface(2),
             recording_surface(3),
         ];
-        for surface in &mut surfaces {
-            surface.draw.handle = handle.clone();
+        for (surface, mode) in surfaces.iter_mut().zip([
+            GpuDrawMode::SharedPass,
+            GpuDrawMode::OwnPass,
+            GpuDrawMode::SharedPass,
+        ]) {
+            surface.draw.handle = GpuPainterHandle::new(owner, FixedPainter(mode)).0;
         }
-
-        for reverse in [false, true] {
-            let preparation = prepare_gpu_paints::<SelectingPainter>(
-                &surfaces,
-                [100, 100],
-                1,
-                |painter, draw, _, phase| {
-                    let snapshot = draw.data.downcast_ref::<u32>().copied().unwrap_or_default();
-                    if snapshot == 3 {
-                        anyhow::bail!("surface failed before mode selection");
-                    }
-                    if phase == GpuPreparationPhase::FinishPrepare {
-                        painter.mode = if (snapshot == 1) != reverse {
-                            GpuDrawMode::SharedPass
-                        } else {
-                            GpuDrawMode::OwnPass
-                        };
+        for _ in 0..2 {
+            let preparation =
+                prepare_gpu_paints::<FixedPainter>(&surfaces, [100, 100], 1, |_, draw, _, _| {
+                    if draw.data.downcast_ref::<u32>() == Some(&3) {
+                        anyhow::bail!("preparation failed");
                     }
                     Ok(())
-                },
-            );
-            let expected = if reverse {
-                [GpuDrawMode::OwnPass, GpuDrawMode::SharedPass]
-            } else {
-                [GpuDrawMode::SharedPass, GpuDrawMode::OwnPass]
-            };
-            assert_eq!(preparation.draw_mode(0), Some(expected[0]));
-            assert_eq!(preparation.draw_mode(1), Some(expected[1]));
+                });
+            assert_eq!(preparation.draw_mode(0), Some(GpuDrawMode::SharedPass));
+            assert_eq!(preparation.draw_mode(1), Some(GpuDrawMode::OwnPass));
             assert_eq!(preparation.draw_mode(2), None);
         }
-        assert_eq!(
-            *selections.lock(),
-            [
-                GpuDrawMode::SharedPass,
-                GpuDrawMode::OwnPass,
-                GpuDrawMode::OwnPass,
-                GpuDrawMode::SharedPass
-            ]
-        );
-        assert_eq!(handle.status().encoded, 0);
     }
 
     #[test]
@@ -616,13 +701,23 @@ mod tests {
 
         let recovery =
             prepare_gpu_paints::<RecordingPainter>(&surfaces, [100, 100], 1, |_, _, _, _| Ok(()));
-        for (index, surface) in surfaces.iter().enumerate() {
+        for (index, (surface, expected_error)) in surfaces
+            .iter()
+            .zip([
+                Some("preparation failed for 1"),
+                Some("preparation failed for 2"),
+                None,
+                None,
+            ])
+            .enumerate()
+        {
             if recovery.is_ready(index) {
                 surface
                     .draw
                     .handle
                     .invoke::<RecordingPainter>(|_| Ok(()))
                     .expect("draw");
+                assert_eq!(surface.draw.handle.take_error().as_deref(), expected_error);
                 assert!(surface.draw.handle.status().last_error.is_none());
                 assert_eq!(surface.draw.handle.status().encoded, 1);
             }
@@ -666,7 +761,9 @@ mod tests {
         assert!(result.is_ok());
         assert!(called);
         assert_eq!(handle.status().encoded, 1);
+        assert_eq!(handle.take_error().as_deref(), Some("encoding failed"));
         assert!(handle.status().last_error.is_none());
+        assert!(handle.take_error().is_none());
     }
 
     #[test]

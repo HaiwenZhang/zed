@@ -1,5 +1,5 @@
 use crate::gpu_painter::{
-    MetalDrawContext, MetalPaintContext, MetalPainter, MetalPainterAdapter, MetalPrepareContext,
+    AnyMetalPainter, MetalDrawContext, MetalPaintContext, MetalPainterAdapter, MetalPrepareContext,
 };
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
@@ -870,7 +870,7 @@ impl MetalRenderer {
 
     fn draw_gpu_surface<'frame>(
         &self,
-        painter: &mut dyn MetalPainter,
+        painter: &mut dyn AnyMetalPainter,
         mode: GpuDrawMode,
         mut context: MetalPaintContext<'frame>,
         data: &(dyn std::any::Any + Send + Sync),
@@ -1817,7 +1817,6 @@ pub struct MetalHeadlessRenderer {
 mod gpu_painter_tests {
     use super::*;
     use gpui::{GpuPaintTarget, Quad};
-    use std::any::Any;
 
     struct Painting {
         mode: GpuDrawMode,
@@ -1906,24 +1905,20 @@ mod gpu_painter_tests {
         }
     }
 
-    impl MetalPainter for SolidPainter {
+    impl SolidPainter {
         fn draw_in_pass(
             &mut self,
             context: &mut MetalDrawContext<'_>,
-            data: &(dyn Any + Send + Sync),
+            painting: &Painting,
         ) -> Result<()> {
-            self.draw(
-                context.encoder,
-                data.downcast_ref::<Painting>().context("painting")?,
-            )
+            self.draw(context.encoder, painting)
         }
 
         fn paint(
             &mut self,
             context: &mut MetalPaintContext<'_>,
-            data: &(dyn Any + Send + Sync),
+            painting: &Painting,
         ) -> Result<()> {
-            let painting = data.downcast_ref::<Painting>().context("painting")?;
             let descriptor = metal::RenderPassDescriptor::new();
             let color = descriptor
                 .color_attachments()
@@ -1955,7 +1950,27 @@ mod gpu_painter_tests {
             encoder.end_encoding();
             result
         }
+    }
 
+    impl crate::MetalPainter for SolidPainter {
+        type Snapshot = Painting;
+
+        fn paint(
+            &mut self,
+            context: &mut MetalPaintContext<'_>,
+            painting: &Painting,
+        ) -> Result<()> {
+            SolidPainter::paint(self, context, painting)
+        }
+        fn reset(&mut self, _: GpuResetReason) {}
+    }
+
+    impl crate::MetalSharedPainter for SolidPainter {
+        type Snapshot = Painting;
+
+        fn paint(&mut self, context: &mut MetalDrawContext<'_>, painting: &Painting) -> Result<()> {
+            SolidPainter::draw_in_pass(self, context, painting)
+        }
         fn reset(&mut self, _: GpuResetReason) {}
     }
 
@@ -1965,7 +1980,9 @@ mod gpu_painter_tests {
             let renderer =
                 MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
             let device = renderer.device.clone();
-            let mut painter = SolidPainter::new(&device)?;
+            let painter = SolidPainter::new(&device)?;
+            let mut independent = MetalPainterAdapter::independent(SolidPainter(painter.0.clone()));
+            let mut shared = MetalPainterAdapter::shared(painter);
             let descriptor = metal::TextureDescriptor::new();
             descriptor.set_width(64);
             descriptor.set_height(64);
@@ -2050,8 +2067,12 @@ mod gpu_painter_tests {
             .enumerate()
             {
                 let previous_encoder = encoder.as_ptr();
+                let painter = match painting.mode {
+                    GpuDrawMode::OwnPass => &mut independent,
+                    GpuDrawMode::SharedPass => &mut shared,
+                };
                 let result = renderer.draw_gpu_surface(
-                    &mut painter,
+                    painter.0.as_mut(),
                     painting.mode,
                     MetalPaintContext {
                         target,
